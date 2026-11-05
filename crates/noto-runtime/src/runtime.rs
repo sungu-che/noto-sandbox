@@ -248,6 +248,16 @@ pub fn label_ko(world: &World, label: &str) -> String {
 pub(crate) const RELOCALIZE_RANGE_M: f32 = 8.0;
 const FIX_GATE_CHI2: f32 = 9.21;
 
+/// A sub-worker that put the first worker's pose right: which, by how much it looked off, and how much of it the fix
+/// took (the Kalman gain), when.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+pub struct PeerFixNote {
+    pub peer: u32,
+    pub gap_m: f32,
+    pub gain: f32,
+    pub time_s: f64,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PoseFix {
     pub dx: f32,
@@ -295,6 +305,8 @@ pub struct Runtime {
     /// A lift truck's rider and carriage camera on the item it is picking up, each checked against the other.
     pub(crate) fork_cross: Option<crate::vision::CrossCheck>,
     pub(crate) pending_fix: Option<PoseFix>,
+    /// The last time a sub-worker in view put this robot's pose right (`relocalize_from_peers`), for the screen.
+    pub(crate) last_peer_fix: Option<PeerFixNote>,
     scan_seq: u64,
     last_device: String,
     pub(crate) eval: EvalCounters,
@@ -352,6 +364,7 @@ impl Runtime {
             gaze_check: None,
             fork_cross: None,
             pending_fix: None,
+            last_peer_fix: None,
             scan_seq: 0,
             last_device: String::new(),
             nn_live: crate::nnlive::NnLive::default(),
@@ -384,6 +397,7 @@ impl Runtime {
             rt.recognizer.mode()
         );
         rt.log("world", Level::Info, msg, Some(json!({"seed": rt.cfg.seed, "cells": rt.cfg.cells})));
+        rt.relay_all_grips();
         Ok(rt)
     }
 
@@ -767,6 +781,8 @@ impl Runtime {
         self.focus = None;
         self.eval = EvalCounters::default();
         self.flush_sds();
+        // What the hands learned of the items stays with them in a new world.
+        self.relay_all_grips();
         if self.stereo() {
             // The head preset (its sensor's baseline) may have changed with the body.
             self.use_stereo();
@@ -948,6 +964,7 @@ impl Runtime {
         let mem = self.mem_ctx();
         let judged = self.gates.judge_with(cands, tick, &mut self.sds, &mem);
         self.relocalize_from(&judged);
+        self.relocalize_from_peers();
         if oracle {
             self.eval.add(&truths, &judged);
         }
@@ -1032,6 +1049,53 @@ impl Runtime {
         }
     }
 
+    /// After the flags, the robots: a sub-worker in the head camera's view is a landmark that moves
+    /// (`World::peers_in_view`). The eye puts it where the look says — the camera's range law for its error, as a
+    /// flag's — and it says where it is and how sure it is; the gap between the two is this robot's odometry off by as
+    /// much as the three σ allow, gated and weighed as a flag is. The best-placed of them corrects the pose; a flag seen
+    /// in the same scan goes first. The recognizer does not name robots: the peer is taken as told by its tag and its
+    /// word over the radio [추정].
+    pub(crate) fn relocalize_from_peers(&mut self) {
+        if self.pending_fix.is_some() {
+            return;
+        }
+        let mem = self.mem_ctx();
+        let p_pose = self.pose_sigma_m().powi(2);
+        let (bx, bz, byaw) = self.me();
+        let (s, c) = byaw.sin_cos();
+        let tick = self.world.tick;
+        let mut best: Option<(f32, f32, f32, u32)> = None;
+        for p in self.world.peers_in_view(&self.cam) {
+            let p_obs = mem.sigma_obs(p.range_m).powi(2);
+            let n = |axis: i32| {
+                let h = world_sim::rng::hash2(self.cfg.seed ^ 0x9EE7 ^ ((p.id as u64) << 20), tick as i32, axis);
+                ((h & 0xFFFF) as f32 / 65535.0 - 0.5) * 12f32.sqrt() * (0.5 * p_obs).sqrt()
+            };
+            let (f, l) = (p.rel_m.0 + n(1), p.rel_m.1 + n(2));
+            // From the body back onto the map by the pose it believes: forward along its yaw, left at yaw − 90°.
+            let seen = (bx + f * c + l * s, bz + f * s - l * c);
+            let (ex, ez) = (p.said.0 - seen.0, p.said.1 - seen.1);
+            let p_peer = p.said_sigma_m.powi(2);
+            if ex * ex + ez * ez > FIX_GATE_CHI2 * (p_pose + p_obs + p_peer) {
+                let msg = format!("위치 보정 안 함: 작업자 {}가 말한 자리와 {:.2} m 달라 보임 — 예상 오차 밖", p.id, ex.hypot(ez));
+                self.log("vision", Level::Debug, msg, None);
+                continue;
+            }
+            if best.as_ref().map_or(true, |b| p_obs + p_peer < b.0) {
+                best = Some((p_obs + p_peer, ex, ez, p.id));
+            }
+        }
+        let Some((p_other, ex, ez, id)) = best else { return };
+        let k = p_pose / (p_pose + p_other).max(1e-9);
+        if k * ex.hypot(ez) > 1e-3 {
+            let odo = self.world.odom.travelled_m;
+            self.pending_fix = Some(PoseFix { dx: k * ex, dz: k * ez, odo_m: odo, prev_odo_m: odo - self.world.odom.since_fix_m });
+            self.last_peer_fix = Some(PeerFixNote { peer: id, gap_m: ex.hypot(ez), gain: k, time_s: self.world.time_s });
+            let msg = format!("위치 보정: 작업자 {id}를 움직이는 기준점으로 — {:.2} m 달라 보여 {:.0}%만큼 고침 (보기 · 동료 σ {:.2} m)", ex.hypot(ez), k * 100.0, p_other.sqrt());
+            self.log("vision", Level::Info, msg, Some(json!({"peer": id, "gap_m": ex.hypot(ez), "gain": k})));
+        }
+    }
+
     pub(crate) fn apply_fix(&mut self) -> Option<PoseFix> {
         let f = self.pending_fix.take()?;
         self.world.relocalize(f.dx, f.dz);
@@ -1079,7 +1143,9 @@ impl Runtime {
     pub fn scan_gaze(&mut self, trigger: &str, pan_deg: f32, tilt_deg: f32) -> Result<()> {
         let level = self.cam;
         self.cam.pitch_deg -= tilt_deg;
-        self.cam.pan_deg += pan_deg;
+        // A look the vision aims takes the head from an off-the-ball glance (`World::glance_rad`): the pan is from the
+        // way the body faces, whatever the neck was doing.
+        self.cam.pan_deg += pan_deg - self.world.glance_rad(1).to_degrees();
         let r = self.scan_now(trigger).map(|_| ());
         self.cam = level;
         r
@@ -1098,7 +1164,7 @@ impl Runtime {
             return false;
         }
         *cd = if intermittent { self.cfg.vision.look_every_ticks } else { self.cfg.approach_scan_every_ticks };
-        let looked = self.scan_now("place").is_ok();
+        let looked = self.scan_gaze("place", 0.0, 0.0).is_ok();
         if looked {
             self.vstats.looks += 1;
         }
@@ -1374,5 +1440,67 @@ fn plan_brief(p: &ParsedCommand) -> String {
         ),
         Some(Plan::Stop) => "중지".to_string(),
         None => p.problem.as_ref().map(|x| format!("해석 불가({})", x.code)).unwrap_or_else(|| "해석 불가".into()),
+    }
+}
+
+#[cfg(test)]
+mod peer_tests {
+    use super::*;
+
+    fn walker() -> Runtime {
+        let lex = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/world_lexicon.json")).expect("lexicon file");
+        let mut cfg = crate::config::RuntimeConfig { parcels: Some(0), ..crate::config::RuntimeConfig::default() };
+        cfg.noto.base = noto_core::BaseKind::HumanFoot;
+        Runtime::new(cfg, &lex, None).expect("runtime")
+    }
+
+    /// A walker whose odometry has run 12 cm off over `walked_m` since its last flag, no flag in sight, and a peer 2 m
+    /// ahead that says where it stands `said_off` m off, having travelled `since_fix_m` since a flag.
+    fn drifted_with_peer(walked_m: f32, said_off: f32, since_fix_m: f32) -> (Runtime, u32) {
+        let mut rt = walker();
+        let w = rt.world_mut();
+        w.nodes.clear();
+        w.waypoints.clear();
+        let id = w.add_crew(&[world_sim::Form::Humanoid], 1)[0];
+        let (x, z, yaw) = (w.agent.x, w.agent.z, w.agent.yaw);
+        let c = w.crew_worker_mut(id).unwrap();
+        (c.x, c.z) = (x + 2.0 * yaw.cos(), z + 2.0 * yaw.sin());
+        c.odom = world_sim::Odometry::new(world_sim::OdomCfg::exact(), 1, true, (c.x + said_off, c.z, c.yaw));
+        c.odom.since_fix_m = since_fix_m;
+        w.odom.x += 0.12;
+        w.odom.since_fix_m = walked_m;
+        (rt, id)
+    }
+
+    fn belief_err(rt: &Runtime) -> f32 {
+        let (bx, bz, _) = rt.world().believed_pose();
+        (bx - rt.world().agent.x).hypot(bz - rt.world().agent.z)
+    }
+
+    #[test]
+    fn peer_landmark_corrects_odometry_drift() {
+        let (mut rt, id) = drifted_with_peer(20.0, 0.0, 0.0);
+        assert!(rt.world().peers_in_view(&rt.cam).iter().any(|p| p.id == id), "the peer is in view");
+        assert!((belief_err(&rt) - 0.12).abs() < 1e-3);
+        rt.scan_now("peer").expect("a scan");
+        let fix = rt.apply_fix().expect("the peer, just put right by a flag, corrects the drift");
+        assert!(fix.dx < -0.05, "it moves the belief back toward where it is: {fix:?}");
+        assert!(belief_err(&rt) < 0.04, "12 cm → {:.3} m", belief_err(&rt));
+    }
+
+    #[test]
+    fn a_peer_that_is_sure_of_a_wrong_place_is_not_taken_and_an_unsure_one_counts_for_little() {
+        // Off by 1 m and sure of itself, to a walker 2 m from its last flag: outside what the σ allow, so the gate turns
+        // it away. (Twenty metres from a flag the walker's own σ is a third of a metre, and the same peer would pass.)
+        let (mut rt, _) = drifted_with_peer(2.0, 1.0, 0.0);
+        rt.scan_now("peer").expect("a scan");
+        assert!(rt.apply_fix().is_none(), "a peer far off its word is not a landmark");
+        assert!((belief_err(&rt) - 0.12).abs() < 1e-3);
+        // As unsure as the walker itself (the same 20 m since a flag): the walker meets it about halfway.
+        let (mut rt, _) = drifted_with_peer(20.0, 0.0, 20.0);
+        rt.scan_now("peer").expect("a scan");
+        let fix = rt.apply_fix().expect("a fix");
+        let k = fix.dx.abs() / 0.12;
+        assert!(k > 0.3 && k < 0.7, "the gain splits the two σ: {k}");
     }
 }

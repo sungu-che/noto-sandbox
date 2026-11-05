@@ -36,11 +36,15 @@ pub struct GraspInput<'a> {
     pub memory_sigma_m: f32,
     pub lead: Option<KinPose>,
     pub look_first: bool,
+    /// The friction the hands expect of this item from their own past grasps of it (what the pads read when they
+    /// began to slip), or `None` for the material's table value. The grip plans with it and the item is as it is: a
+    /// prior above the table is ignored, so what the hands learn makes them grip harder, never softer.
+    pub mu_prior: Option<f32>,
 }
 
 impl<'a> GraspInput<'a> {
     pub fn front(body: &'a Body, hand: &'a Hand, material: ItemMaterial, mass_kg: f32, size_m: [f32; 3], ground: Surface, two_arms: bool, cargo_kg: f32, aim_sigma_m: f32, seed: u64) -> GraspInput<'a> {
-        GraspInput { body, hand, material, mass_kg, size_m, ground, two_arms, cargo_kg, aim_sigma_m, seed, mode: ReachMode::Front, aim_offset_m: [0.0; 2], memory_sigma_m: 0.0, lead: None, look_first: false }
+        GraspInput { body, hand, material, mass_kg, size_m, ground, two_arms, cargo_kg, aim_sigma_m, seed, mode: ReachMode::Front, aim_offset_m: [0.0; 2], memory_sigma_m: 0.0, lead: None, look_first: false, mu_prior: None }
     }
 }
 
@@ -476,9 +480,12 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
     let mut metrics: Vec<(&'static str, f32)> = Vec::new();
     let half = [0.5 * inp.size_m[0], 0.5 * inp.size_m[2]];
     let mu = material::pad_on(inp.material);
+    // What the grip believes of the item: the table, or what the hands felt of it before (`mu_prior`). The item's
+    // own friction is drawn from the table either way.
+    let mu_plan = inp.mu_prior.map_or(mu.mean, |m| m.clamp(0.05, mu.mean));
     let working = body.working_hand(inp.hand);
     let pads = HandPads::shaped(&working, inp.size_m, inp.material.shape(), pad_surface(inp.ground), inp.seed);
-    let planned = TopHands::of(&pads.closed, inp.mass_kg, mu.mean);
+    let planned = TopHands::of(&pads.closed, inp.mass_kg, mu_plan);
     // One arm has no second hand to call on: it tries alone, and the grip decides.
     let both_needed = inp.mode == ReachMode::Front && !inp.two_arms && planned.hands != 1 && body.arm_count() > 1;
     let two_asked = inp.two_arms || both_needed;
@@ -527,7 +534,7 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
     let jaw_force = body.gripper.as_ref().filter(|_| body.gripper_only()).and_then(|g| g.peak_n).is_some() && cap.contacts == 2;
     let squeeze_max = if jaw_force { cap.squeeze_n } else { pads.squeeze_max_n() };
     let preload_n = contact::PRELOAD_N * touching as f32;
-    let mut ctl = GripCtl { preload_n, cap_n: squeeze_max, mu_est: mu.mean, react: None };
+    let mut ctl = GripCtl { preload_n, cap_n: squeeze_max, mu_est: mu_plan, react: None };
     let hold = hold_pose_for(body, two_arms, inp.cargo_kg);
     let plan_rise_s = if body.mast_arms() {
         let up = kin::solve_fast(body, &KinPose { cargo_kg: inp.cargo_kg, lift_m: hold.lift_m, ..stand }, &KinLoads::holding(inp.mass_kg, two_arms, 0.0));
@@ -537,9 +544,9 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
     };
     let rise_dz = (kin::solve_fast(body, &hold, &KinLoads::default()).hands[0][2] - plan.empty.hands[0][2]).max(0.05);
     let a_plan = MIN_JERK_ACC * rise_dz / (plan_rise_s * plan_rise_s);
-    let grip_target = preload_n + GRIP_SAFETY * per_hand_kg * (G + a_plan) / (SQUEEZE_SURFACES * mu.mean.max(0.05));
+    let grip_target = preload_n + GRIP_SAFETY * per_hand_kg * (G + a_plan) / (SQUEEZE_SURFACES * mu_plan.max(0.05));
     let grip_peak = grip_target.min(squeeze_max);
-    let a_room = SQUEEZE_SURFACES * mu.mean * (squeeze_max - preload_n) / (GRIP_SAFETY * per_hand_kg.max(1e-3)) - G;
+    let a_room = SQUEEZE_SURFACES * mu_plan * (squeeze_max - preload_n) / (GRIP_SAFETY * per_hand_kg.max(1e-3)) - G;
     let rise_s = if a_room >= a_plan {
         plan_rise_s
     } else {
@@ -552,7 +559,7 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
     let sigma_expect = inp.aim_sigma_m.hypot(inp.memory_sigma_m);
     let hit = |half: f32| if sigma_expect > 1e-6 { super::erf(half / (sigma_expect * std::f32::consts::SQRT_2)) } else { 1.0 };
     let need_mu = per_hand_kg * (G + MIN_JERK_ACC * rise_dz / (rise_s * rise_s)) / (SQUEEZE_SURFACES * grip_peak.max(1e-3));
-    let p_success = if touching >= 2 { hit(half[0]) * hit(half[1]) * super::lognormal_above(mu.mean, mu.cov, need_mu) } else { 0.0 };
+    let p_success = if touching >= 2 { hit(half[0]) * hit(half[1]) * super::lognormal_above(mu_plan, mu.cov, need_mu) } else { 0.0 };
     metrics.push(("p_success", p_success));
 
     let mut bottom = KinPose { closure: 0.0, ..plan.pose };
@@ -595,7 +602,10 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
     let t_contact = s.end();
     metrics.push(("aim_err_m", (aim[0] * aim[0] + aim[1] * aim[1]).sqrt()));
     metrics.push(("mu", mu_act));
-    metrics.push(("mu_est", mu.mean));
+    metrics.push(("mu_est", mu_plan));
+    if inp.mu_prior.is_some() {
+        metrics.push(("mu_table", mu.mean));
+    }
     metrics.push(("squeeze_cap_n", squeeze_max));
     metrics.push(("squeeze_plan_n", cap.squeeze_n));
     metrics.push(("touching", touching as f32));

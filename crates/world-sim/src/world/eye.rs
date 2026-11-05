@@ -196,7 +196,8 @@ impl World {
             return (pose, src == noto_core::Source::FootLift);
         }
         let slope = if self.body.legged() { 0.0 } else { self.posture_now().0.slope_deg };
-        (KinPose { base_pitch_deg: slope, ..KinPose::stand(&self.body, self.carried_kg()) }, false)
+        let glance = if self.crew_turn.is_none() { self.glance_rad(1).to_degrees() } else { 0.0 };
+        (KinPose { base_pitch_deg: slope, neck_pan_deg: glance, ..KinPose::stand(&self.body, self.carried_kg()) }, false)
     }
 
     pub fn head_view(&self, cam: &Camera) -> HeadView {

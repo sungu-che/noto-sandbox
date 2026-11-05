@@ -26,6 +26,8 @@ pub struct ActPlay {
     pub drive: Option<ActDrive>,
     /// The drop the act is lifting off the ground (hidden from the scene while it rides the tines).
     pub lifting: Option<u32>,
+    /// The state of the pads on the item a grasp holds (`PadSurface::id`: dry, wet), which its feel is kept under.
+    pub pads: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -42,7 +44,7 @@ pub const FORK_ALIGN_RAD_S: f32 = 1.2;
 
 impl ActPlay {
     fn new(rollout: ActRollout, start_s: f64, object: Option<(ItemKind, f32)>, origin: (f32, f32, f32)) -> ActPlay {
-        ActPlay { rollout, start_s, elapsed_s: 0.0, played_s: -1.0, object, origin, drive: None, lifting: None }
+        ActPlay { rollout, start_s, elapsed_s: 0.0, played_s: -1.0, object, origin, drive: None, lifting: None, pads: None }
     }
 
     pub fn t(&self) -> f32 {
@@ -131,6 +133,7 @@ impl World {
         let offset = [ox * ch + oz * sh, ox * sh - oz * ch];
         let mode = if side { ReachMode::Side } else { ReachMode::Front };
         let lead = self.gaze.take().filter(|g| !side && (g.x - at.0).hypot(g.z - at.1) < 0.5).map(|g| g.pose);
+        let mu_prior = self.grip_mu.get(&grip_key(d.kind.id(), agrasp::pad_surface(ground).id())).copied();
         let inp = agrasp::GraspInput {
             body: &self.body,
             hand: &self.hand,
@@ -147,6 +150,7 @@ impl World {
             memory_sigma_m,
             look_first: lead.is_none(),
             lead,
+            mu_prior,
         };
         let mut rollout = agrasp::grasp(&inp);
         if matches!(rollout.outcome.code, Some("reach_ground") | Some("reach_side")) {
@@ -188,6 +192,7 @@ impl World {
         let dur = rollout.duration_s;
         let mut play = ActPlay::new(rollout, self.time_s, Some((d.kind, d.amount)), (self.agent.x, self.agent.z, heading));
         play.lifting = Some(drop);
+        play.pads = Some(agrasp::pad_surface(ground).id());
         self.act = Some(play);
         Ok((dur, (!side).then_some(at)))
     }
@@ -582,6 +587,10 @@ impl World {
             let lift = (self.walk.step_lift_m + 0.03) / gait::SWING_LIFT_M;
             if lift > 1.0 {
                 pose.feet[1 - self.walk.stance][1] *= lift;
+            }
+            // Empty hands on the move: the head glances off the way now and then (`glance_rad`).
+            if self.crew_turn.is_none() {
+                pose.neck_pan_deg += self.glance_rad(1).to_degrees();
             }
             return Some((self.crouched(self.carrying(pose)), self.carried_loads(loads.accel), Source::FootLift));
         }

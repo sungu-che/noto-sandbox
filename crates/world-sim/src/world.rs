@@ -375,6 +375,9 @@ pub struct World {
     balance_events: Vec<BalanceEvent>,
     pub ff_gains: BTreeMap<Source, f32>,
     pub ff_enabled: bool,
+    /// The friction the hands expect of an item on pads in a state (`grip_key`), learned from what they felt of it:
+    /// the grasp plans with it instead of the table (`GraspInput::mu_prior`).
+    pub grip_mu: BTreeMap<String, f32>,
     pub heat: BTreeMap<String, f32>,
     pub wear: BTreeMap<String, f32>,
     pub motion: Option<Motion>,
@@ -408,6 +411,13 @@ pub struct World {
     /// The sub-worker standing in for the first worker in the motion code this moment, and the robots it must miss.
     pub(crate) crew_turn: Option<u32>,
     pub(crate) turn_others: Vec<traffic::RobotOutline>,
+    /// Off-the-ball glances (`gaze::scan_pan_deg`) on the move with empty hands: the sub-workers' eyes, which only keep
+    /// them clear of each other, glance by default; the first worker's head camera, whose frames its vision reads,
+    /// only when asked.
+    pub scan_crew: bool,
+    pub scan_first: bool,
+    /// The robots the first worker's eye saw a moment ago (`traffic::Noticed`).
+    pub noticed: Vec<traffic::Noticed>,
 }
 
 impl Clone for World {
@@ -433,6 +443,7 @@ impl Clone for World {
             balance_events: self.balance_events.clone(),
             ff_gains: self.ff_gains.clone(),
             ff_enabled: self.ff_enabled,
+            grip_mu: self.grip_mu.clone(),
             heat: self.heat.clone(),
             wear: self.wear.clone(),
             motion: self.motion.clone(),
@@ -459,6 +470,9 @@ impl Clone for World {
             stride: self.stride.clone(),
             crew_turn: self.crew_turn,
             turn_others: self.turn_others.clone(),
+            scan_crew: self.scan_crew,
+            scan_first: self.scan_first,
+            noticed: self.noticed.clone(),
         }
     }
 }
@@ -479,6 +493,11 @@ fn wrap_angle(a: f32) -> f32 {
         a += std::f32::consts::TAU;
     }
     a
+}
+
+/// The key a learned grip goes by (`World::grip_mu`): the item and the state of the pads on it (`PadSurface::id`).
+pub fn grip_key(item: &str, pads: &str) -> String {
+    format!("{item}:{pads}")
 }
 
 pub(crate) fn add_stock(list: &mut Vec<(ItemKind, f32)>, kind: ItemKind, n: f32) {
@@ -736,6 +755,7 @@ impl World {
             balance_events: Vec::new(),
             ff_gains: BTreeMap::new(),
             ff_enabled: true,
+            grip_mu: BTreeMap::new(),
             heat: BTreeMap::new(),
             wear: BTreeMap::new(),
             motion: None,
@@ -762,6 +782,9 @@ impl World {
             stride: Stride::default(),
             crew_turn: None,
             turn_others: Vec::new(),
+            scan_crew: true,
+            scan_first: false,
+            noticed: Vec::new(),
         })
     }
 
@@ -778,6 +801,9 @@ impl World {
         fresh.wear = std::mem::take(&mut self.wear);
         fresh.ff_gains = std::mem::take(&mut self.ff_gains);
         fresh.ff_enabled = self.ff_enabled;
+        fresh.grip_mu = std::mem::take(&mut self.grip_mu);
+        fresh.scan_crew = self.scan_crew;
+        fresh.scan_first = self.scan_first;
         fresh.tick = self.tick;
         fresh.time_s = self.time_s;
         *self = fresh;
@@ -1433,9 +1459,11 @@ impl World {
     fn hold_for_robot(&mut self, m: &mut MoveState, dt: f32, events: &mut Vec<TimedEvent>) -> bool {
         let fp = self.footprint();
         let reversing = self.motion_view().is_some_and(|m| m.reversing);
-        let me = traffic::Looker { id: 1, at: (self.agent.x, self.agent.z), dir: self.travel_dir(), half_w: fp.half_w_m, front: if reversing { fp.rear_m } else { fp.front_m }, speed: self.agent.speed_mps, eye_m: self.standing_eye_m() };
+        let me = traffic::Looker { id: 1, at: (self.agent.x, self.agent.z), dir: self.travel_dir(), half_w: fp.half_w_m, front: if reversing { fp.rear_m } else { fp.front_m }, speed: self.agent.speed_mps, eye_m: self.standing_eye_m(), gaze: self.glance_rad(1) };
+        let seen = self.robots_seen(&me);
+        traffic::remember(&mut self.noticed, seen, self.time_s);
         let path: Vec<(f32, f32)> = m.edges[m.idx.min(m.edges.len())..].iter().map(|e| crate::terrain::cell_center(e.to.0, e.to.1)).collect();
-        let Some((other, gap)) = self.robot_in_way(&me, &path) else {
+        let Some((other, gap)) = self.robot_in_way(&me, &path, &self.noticed) else {
             m.held_s = 0.0;
             m.held_by = None;
             return false;

@@ -17,7 +17,7 @@ pub mod terrain;
 pub mod world;
 
 pub use capture::{decode_webp, encode_webp, Encoded};
-pub use crew::{Form, Job, Worker};
+pub use crew::{Form, Job, PeerSight, Worker};
 pub use kinds::{Ground, ItemKind, ItemSpec, NodeKind, NodeSpec};
 pub use light::Lighting;
 pub use odometry::{OdomCfg, Odometry};
@@ -26,4 +26,4 @@ pub use render::{Camera, Frame, ObjectClass, VisibleObject};
 pub use site::{Site, SiteCfg, Support};
 pub use snapshot::{GraspInfo, MotionView, SiteView, TerrainGrid, WorldSnapshot};
 pub use terrain::{CurbKind, TerrainKind};
-pub use world::{amount_text, Action, ActionError, BalanceEvent, TimedEvent, World, WorldConfig, WorldEvent, TICK_S};
+pub use world::{amount_text, grip_key, Action, ActionError, BalanceEvent, TimedEvent, World, WorldConfig, WorldEvent, TICK_S};

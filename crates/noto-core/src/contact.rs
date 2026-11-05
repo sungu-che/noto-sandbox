@@ -28,6 +28,16 @@ pub enum PadSurface {
     Dusty,
 }
 
+impl PadSurface {
+    pub fn id(self) -> &'static str {
+        match self {
+            PadSurface::Dry => "dry",
+            PadSurface::Wet => "wet",
+            PadSurface::Dusty => "dusty",
+        }
+    }
+}
+
 pub fn pad_mu(mu_table: f32, n: f32, surface: PadSurface) -> f32 {
     let n = n.clamp(PAD_MU_N_RANGE[0], PAD_MU_N_RANGE[1]);
     let law = (n / PAD_MU_REF_N).powf(PAD_MU_FORCE_EXP).max(PAD_MU_FLOOR);

@@ -18,6 +18,9 @@ use super::*;
 pub const SIGHT_HALF_FOV_DEG: f32 = 35.0;
 /// The farthest the way-ahead check looks (m).
 pub const SIGHT_RANGE_M: f32 = 6.0;
+/// How long a robot the eye saw stays in mind after it left the view (s): until the next off-the-ball glance
+/// (`gaze::SCAN_PERIOD_S`) looks again, where it was going when seen.
+pub const NOTICE_KEEP_S: f32 = noto_core::act::gaze::SCAN_PERIOD_S;
 /// Clearance kept between two robots' outlines when one stops for the other (m) [추정: a hand's breadth beyond the
 /// bodies], plus the distance it covers in a second at its speed (reaction and braking).
 pub const KEEP_CLEAR_M: f32 = 0.45;
@@ -159,16 +162,18 @@ pub struct RobotOutline {
     pub half_w: f32,
     pub moving: bool,
     pub humanoid: bool,
+    /// Its velocity (m/s along x, z): what an eye that sees it moving for a fixation can tell.
+    pub vel: (f32, f32),
 }
 
 impl RobotOutline {
     /// A round outline, for someone on foot.
-    fn round(id: u32, x: f32, z: f32, r: f32, moving: bool) -> RobotOutline {
-        RobotOutline { id, x, z, yaw: 0.0, front: r, rear: r, half_w: r, moving, humanoid: true }
+    fn round(id: u32, x: f32, z: f32, r: f32, moving: bool, vel: (f32, f32)) -> RobotOutline {
+        RobotOutline { id, x, z, yaw: 0.0, front: r, rear: r, half_w: r, moving, humanoid: true, vel }
     }
 
-    fn of(id: u32, x: f32, z: f32, yaw: f32, fp: crate::clear::Footprint, moving: bool, humanoid: bool) -> RobotOutline {
-        RobotOutline { id, x, z, yaw, front: fp.front_m, rear: fp.rear_m, half_w: fp.half_w_m, moving, humanoid }
+    fn of(id: u32, x: f32, z: f32, yaw: f32, fp: crate::clear::Footprint, moving: bool, humanoid: bool, speed: f32) -> RobotOutline {
+        RobotOutline { id, x, z, yaw, front: fp.front_m, rear: fp.rear_m, half_w: fp.half_w_m, moving, humanoid, vel: (speed * yaw.cos(), speed * yaw.sin()) }
     }
 
     /// Whether a point lies within `pad` of the outline.
@@ -186,7 +191,9 @@ impl RobotOutline {
 }
 
 /// The robot looking: where it is, which way it goes and how fast, how wide its way is (half its width) and how far
-/// its body reaches ahead along it, and its eye height.
+/// its body reaches ahead along it, its eye height, and how far its head has turned off the way (`gaze`, rad, to its
+/// left positive as `KinPose::neck_pan_deg`: an off-the-ball glance). A body's left lies at its yaw − 90° on the map,
+/// so the eye looks along `dir − gaze` (`Looker::eye_dir`), as the head camera's view does (`World::head_view`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Looker {
     pub id: u32,
@@ -196,6 +203,42 @@ pub struct Looker {
     pub front: f32,
     pub speed: f32,
     pub eye_m: f32,
+    pub gaze: f32,
+}
+
+impl Looker {
+    /// Where the eye points on the map (rad).
+    pub fn eye_dir(&self) -> f32 {
+        self.dir - self.gaze
+    }
+}
+
+/// A robot an eye saw: where and how fast it was going, and when.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct Noticed {
+    pub id: u32,
+    pub at: (f32, f32),
+    pub vel: (f32, f32),
+    pub time_s: f64,
+}
+
+impl Noticed {
+    /// Where it should be at `now`, going on as it went.
+    pub fn at_time(&self, now: f64) -> (f32, f32) {
+        let age = (now - self.time_s).max(0.0) as f32;
+        (self.at.0 + self.vel.0 * age, self.at.1 + self.vel.1 * age)
+    }
+}
+
+/// Keeps in `mind` what the eye sees `now` and what it saw within `NOTICE_KEEP_S`.
+pub fn remember(mind: &mut Vec<Noticed>, seen: Vec<Noticed>, now: f64) {
+    mind.retain(|n| now - n.time_s <= NOTICE_KEEP_S as f64 && !seen.iter().any(|s| s.id == n.id));
+    mind.extend(seen);
+}
+
+/// Whether robot `o` is robot `me` itself or its rider on foot.
+fn owns(me: u32, o: u32) -> bool {
+    o == me || (me == 1 && o == RIDER_ID) || (me == RIDER_ID && o == 1) || (me > 1 && me < RIDER_ID && o == RIDER_ID + me) || (me > RIDER_ID && o == me - RIDER_ID)
 }
 
 /// Whether a robot that has stopped for `other` routes round it (the other waits): the lower rank does, and of two
@@ -226,17 +269,51 @@ impl World {
         // On the move: going somewhere, even while stopped for another robot (so that two which stopped for each
         // other still tell who gives way).
         let agent_moving = matches!(self.active, Some((_, Active::Move(_))));
-        let mut v = vec![RobotOutline::of(1, self.agent.x, self.agent.z, self.agent.yaw, self.footprint(), agent_moving, self.body.legged())];
+        let rider_vel = |r: &Rider| if matches!(r.phase, RiderPhase::WalkOut | RiderPhase::WalkBack) { (RIDER_WALK_MPS * r.yaw.cos(), RIDER_WALK_MPS * r.yaw.sin()) } else { (0.0, 0.0) };
+        let mut v = vec![RobotOutline::of(1, self.agent.x, self.agent.z, self.agent.yaw, self.footprint(), agent_moving, self.body.legged(), self.agent.speed_mps)];
         if let Some(r) = self.rider.filter(|r| r.off()) {
-            v.push(RobotOutline::round(RIDER_ID, r.x, r.z, RIDER_R_M, !matches!(r.phase, RiderPhase::Mine)));
+            v.push(RobotOutline::round(RIDER_ID, r.x, r.z, RIDER_R_M, !matches!(r.phase, RiderPhase::Mine), rider_vel(&r)));
         }
         for w in &self.crew {
-            v.push(RobotOutline::of(w.id, w.x, w.z, w.yaw, w.footprint, matches!(w.job, crate::crew::Job::Go { .. }), w.form == crate::crew::Form::Humanoid));
+            v.push(RobotOutline::of(w.id, w.x, w.z, w.yaw, w.footprint, matches!(w.job, crate::crew::Job::Go { .. }), w.form == crate::crew::Form::Humanoid, w.speed_mps));
             if let Some(r) = w.rider.filter(|r| r.off()) {
-                v.push(RobotOutline::round(RIDER_ID + w.id, r.x, r.z, RIDER_R_M, !matches!(r.phase, RiderPhase::Mine)));
+                v.push(RobotOutline::round(RIDER_ID + w.id, r.x, r.z, RIDER_R_M, !matches!(r.phase, RiderPhase::Mine), rider_vel(&r)));
             }
         }
         v
+    }
+
+    /// How far robot `id` has its head turned off its way now for an off-the-ball glance (rad, left positive): on the
+    /// move with nothing in its hands, the sub-workers when `scan_crew`, the first worker when `scan_first`. Each robot
+    /// keeps its own beat, so that a crew does not look the same way at once.
+    pub fn glance_rad(&self, id: u32) -> f32 {
+        let (body, moving, empty) = if id == 1 && self.crew_turn.is_none() {
+            (&self.body, self.scan_first && matches!(self.active, Some((_, Active::Move(_)))) && self.agent.speed_mps > 0.05 && self.act.is_none(), self.carried_kg() <= AMOUNT_EPS)
+        } else if let Some(w) = self.crew.iter().find(|w| w.id == id) {
+            (&w.body, self.scan_crew && matches!(w.job, crate::crew::Job::Go { .. }) && w.speed_mps > 0.05, w.carried_kg() <= AMOUNT_EPS)
+        } else {
+            return 0.0;
+        };
+        if !moving || !empty {
+            return 0.0;
+        }
+        let beat = (id as f32 * 0.61).rem_euclid(noto_core::act::gaze::SCAN_PERIOD_S);
+        noto_core::act::gaze::scan_pan_deg(body, self.time_s as f32 + beat).to_radians()
+    }
+
+    /// The robots the eye of `me` sees now: inside its camera's horizontal view about where its head points (the way
+    /// plus its glance), within sight, not behind a node.
+    pub fn robots_seen(&self, me: &Looker) -> Vec<Noticed> {
+        let half = SIGHT_HALF_FOV_DEG.to_radians();
+        self.robot_outlines()
+            .into_iter()
+            .filter(|o| !owns(me.id, o.id))
+            .filter(|o| {
+                let (dx, dz) = (o.x - me.at.0, o.z - me.at.1);
+                wrap_angle(dz.atan2(dx) - me.eye_dir()).abs() <= half && dx.hypot(dz) <= SIGHT_RANGE_M && self.line_of_sight(me.at, (o.x, o.z), me.eye_m.min(1.2))
+            })
+            .map(|o| Noticed { id: o.id, at: (o.x, o.z), vel: o.vel, time_s: self.time_s })
+            .collect()
     }
 
     /// Whether the straight line from `a` to `b` (both at `h` above the ground) passes clear of every node.
@@ -257,14 +334,15 @@ impl World {
         })
     }
 
-    /// The nearest robot the eye of `me` sees in its way: in the camera's horizontal field of view about the way it
-    /// goes (or close enough to touch), not hidden behind a node, and standing on the stretch of its path (`path`,
-    /// the points it goes through next) it covers before it could stop — its body's reach ahead and the stopping
-    /// distance. (its id, the path length to it in m). A robot the path passes clear of is passed, not waited for.
-    pub fn robot_in_way(&self, me: &Looker, path: &[(f32, f32)]) -> Option<(u32, f32)> {
+    /// The nearest robot the eye of `me` sees in its way: in the camera's horizontal field of view about where its head
+    /// points (or close enough to touch), not hidden behind a node — or one it saw a moment ago (`mind`, at most
+    /// `NOTICE_KEEP_S` old) where it was going then — and standing on the stretch of its path (`path`, the points it
+    /// goes through next) it covers before it could stop: its body's reach ahead and the stopping distance. (its id,
+    /// the path length to it in m). A robot the path passes clear of is passed, not waited for.
+    pub fn robot_in_way(&self, me: &Looker, path: &[(f32, f32)], mind: &[Noticed]) -> Option<(u32, f32)> {
         let look = me.front + KEEP_CLEAR_M + me.speed.max(0.3) * 1.0;
         let half = SIGHT_HALF_FOV_DEG.to_radians();
-        let own = |o: u32| o == me.id || (me.id == 1 && o == RIDER_ID) || (me.id == RIDER_ID && o == 1) || (me.id > 1 && me.id < RIDER_ID && o == RIDER_ID + me.id) || (me.id > RIDER_ID && o == me.id - RIDER_ID);
+        let own = |o: u32| owns(me.id, o);
         // The path ahead every 0.15 m, with the distance along it.
         let mut samples: Vec<(f32, f32, f32)> = Vec::new();
         let (mut prev, mut run) = (me.at, 0.0f32);
@@ -295,13 +373,22 @@ impl World {
             .filter_map(|o| {
                 let (dx, dz) = (o.x - me.at.0, o.z - me.at.1);
                 let d = dx.hypot(dz);
-                let bearing = wrap_angle(dz.atan2(dx) - me.dir).abs();
+                let ahead = wrap_angle(dz.atan2(dx) - me.dir).abs();
+                let looked = wrap_angle(dz.atan2(dx) - me.eye_dir()).abs();
                 let touching = o.near(me.at, me.half_w + 0.05);
-                let seen = (bearing <= half && d <= SIGHT_RANGE_M) || touching;
+                let seen = ((looked <= half && d <= SIGHT_RANGE_M) || touching) && self.line_of_sight(me.at, (o.x, o.z), me.eye_m.min(1.2));
+                // Out of view now but seen a moment ago: it is where it was going then, as far as this robot knows.
+                let o = match mind.iter().find(|n| n.id == o.id).filter(|n| !seen && self.time_s - n.time_s <= NOTICE_KEEP_S as f64) {
+                    Some(n) => {
+                        let (x, z) = n.at_time(self.time_s);
+                        RobotOutline { x, z, ..o }
+                    }
+                    None if seen => o,
+                    None => return None,
+                };
                 // Bodies that would overlap: the path's points within both half widths of the robot's centre.
                 let hit = samples.iter().find(|s| o.near((s.0, s.1), me.half_w - 0.05)).map(|s| s.2);
-                let hit = hit.or(touching.then_some(0.0).filter(|_| bearing <= half));
-                hit.filter(|_| seen && self.line_of_sight(me.at, (o.x, o.z), me.eye_m.min(1.2))).map(|s| (o.id, s))
+                hit.or(touching.then_some(0.0).filter(|_| ahead <= half)).map(|s| (o.id, s))
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))
     }
@@ -397,9 +484,9 @@ impl World {
             }
         }
         let to = r.via.unwrap_or(goal);
-        let me = Looker { id, at: (r.x, r.z), dir: (to.1 - r.z).atan2(to.0 - r.x), half_w: RIDER_R_M, front: RIDER_R_M, speed: RIDER_WALK_MPS, eye_m: rider_eye_m(&self.body) };
+        let me = Looker { id, at: (r.x, r.z), dir: (to.1 - r.z).atan2(to.0 - r.x), half_w: RIDER_R_M, front: RIDER_R_M, speed: RIDER_WALK_MPS, eye_m: rider_eye_m(&self.body), gaze: 0.0 };
         let path: Vec<(f32, f32)> = r.via.into_iter().chain(std::iter::once(goal)).collect();
-        if let Some((other, _)) = self.robot_in_way(&me, &path) {
+        if let Some((other, _)) = self.robot_in_way(&me, &path, &[]) {
             r.held_s += dt;
             if r.held_s >= YIELD_HUMANOID_S {
                 // Step round it on the side nearer the goal.

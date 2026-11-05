@@ -122,6 +122,12 @@ impl Runtime {
                 _ => self.sds.record_baseline(&s2, k, *v as f64),
             }
         }
+        // What the pads felt of the item goes back into the next grasp of it (`relay`).
+        if let (ActKind::Grasp, Some((item, _)), Some(pads)) = (action, p.object, p.pads) {
+            let table_planned = r.metric("mu_table").map_or(true, |t| r.metric("mu_est").is_some_and(|e| (e - t).abs() < 1e-6));
+            crate::relay::record_grasp_feel(&mut self.sds, item.id(), pads, table_planned, r.metric("incipient_slips").unwrap_or(0.0), r.metric("mu_seen"));
+            self.relay_grip(item, pads);
+        }
         if action == ActKind::Push {
             self.record_push_layers(r);
             return;

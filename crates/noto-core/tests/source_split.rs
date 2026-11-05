@@ -25,9 +25,13 @@ fn the_registry_finds_the_engine_and_leaves_the_benchmarks_out() {
         "crates/noto-vision/src/decide.rs",
         "crates/noto-runtime/src/driver.rs",
         "crates/noto-runtime/src/vision.rs",
+        "crates/noto-runtime/src/relay.rs",
     ] {
         assert!(files.iter().any(|x| x == f), "{f} is engine: {files:?}");
     }
+    // What the robot felt goes back into its grip there (`relay`): a decision file, so it is held to never reading a
+    // reference axis.
+    assert!(DECISION_FILES.contains(&"crates/noto-runtime/src/relay.rs"));
     for f in ["crates/noto-core/src/actbench.rs", "crates/noto-core/src/bench.rs", "crates/noto-core/src/effects.rs", "crates/noto-core/src/nn.rs", "crates/noto-core/src/lib.rs", "crates/noto-runtime/src/actsds.rs", "crates/noto-runtime/src/api.rs"] {
         assert!(!files.iter().any(|x| x == f), "{f} is not engine");
     }

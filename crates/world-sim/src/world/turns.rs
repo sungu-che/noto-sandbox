@@ -5,10 +5,11 @@
 use super::*;
 use crate::crew::Worker;
 
-/// How a sub-worker's step of a move ended.
+/// How a sub-worker's step of a move ended, and what its wheels slipped on it (for its odometry).
 pub(crate) struct MoveStep {
     pub done: Option<(bool, Option<String>)>,
     pub lost: bool,
+    pub slip_over: f32,
 }
 
 impl World {
@@ -122,7 +123,7 @@ impl World {
                 left -= used.max(1e-6);
             }
             let lost = world.ride_cargo(dt, true, id, &mut local);
-            MoveStep { done, lost }
+            MoveStep { done, lost, slip_over: std::mem::take(&mut world.odom_over) }
         });
         // The first worker's driver listens to these events: of a sub-worker's, only what it did to the world.
         events.extend(local.into_iter().filter(|e| matches!(e.event, WorldEvent::Bump { .. } | WorldEvent::CargoSlip { .. } | WorldEvent::CargoLost { .. } | WorldEvent::StepSeen { .. } | WorldEvent::StepTaken { .. } | WorldEvent::Hold { .. })));

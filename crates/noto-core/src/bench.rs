@@ -496,7 +496,7 @@ pub fn ux_lines(summaries: &[Summary]) -> Vec<String> {
     out
 }
 
-pub const ENGINE_FILES: [&str; 12] = [
+pub const ENGINE_FILES: [&str; 13] = [
     "crates/noto-core/src/**/*.rs",
     "crates/world-sim/src/**/*.rs",
     "crates/noto-vision/src/**/*.rs",
@@ -509,6 +509,7 @@ pub const ENGINE_FILES: [&str; 12] = [
     "crates/noto-runtime/src/cargo.rs",
     "crates/noto-runtime/src/chase.rs",
     "crates/noto-runtime/src/perception.rs",
+    "crates/noto-runtime/src/relay.rs",
 ];
 
 pub const NOT_ENGINE: [(&str, &str); 3] = [
@@ -519,7 +520,7 @@ pub const NOT_ENGINE: [(&str, &str); 3] = [
 
 pub const REFERENCE_SECTIONS: [(&str, &str); 1] = [("crates/noto-core/src/balance.rs", "pub struct RefCtx {")];
 
-pub const DECISION_FILES: [&str; 4] = ["crates/noto-runtime/src/driver.rs", "crates/noto-runtime/src/mldrive.rs", "crates/noto-runtime/src/vision.rs", "crates/noto-runtime/src/precision.rs"];
+pub const DECISION_FILES: [&str; 5] = ["crates/noto-runtime/src/driver.rs", "crates/noto-runtime/src/mldrive.rs", "crates/noto-runtime/src/vision.rs", "crates/noto-runtime/src/precision.rs", "crates/noto-runtime/src/relay.rs"];
 
 pub const REFERENCE_READS: [&str; 13] = [
     "reference_report",

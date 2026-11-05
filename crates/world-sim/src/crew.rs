@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::clear::{self, Footprint};
 use crate::kinds::ItemKind;
 use crate::nav::{self, Goal};
+use crate::odometry::Odometry;
 use crate::render::Obb;
 use crate::snapshot::{drop_id, node_id, waypoint_id, CarryView};
 use crate::terrain::cell_center;
@@ -44,6 +45,29 @@ pub const BAY_SLOT_M: f32 = 0.55;
 pub const BAY_SLOTS: usize = 6;
 /// How far in front of the bay the row of slots lies (m).
 pub const BAY_ROW_AHEAD_M: f32 = 0.6;
+/// How far a flag may be for a sub-worker's eye to put its odometry right by it (m): the first worker's
+/// `RELOCALIZE_RANGE_M`.
+pub const FLAG_FIX_RANGE_M: f32 = 8.0;
+
+/// A sub-worker in the first worker's view (`World::peers_in_view`): where the eye has it from the body (forward and
+/// left, m: its true offset; the error of the look is the runtime's to put on it), how far, and what it says of
+/// where it is on the map and how sure it is (its odometry and `Worker::pose_sigma_m`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct PeerSight {
+    pub id: u32,
+    pub rel_m: (f32, f32),
+    pub range_m: f32,
+    pub said: (f32, f32),
+    pub said_sigma_m: f32,
+}
+
+/// What one look at a flag `d_m` away is worth to a robot's eye (m, 1σ): its head sensor's range law along the ray
+/// (`stereo_depth_sigma`) and a pixel across it — the law the first worker's look at a flag is weighed by.
+pub fn flag_look_sigma_m(body: &Body, d_m: f32) -> f32 {
+    let (f, b, sub) = crate::world::camera_of(body.head.sensor);
+    let along = noto_core::act::material::stereo_depth_sigma(d_m, f, b, sub);
+    (along * along + (d_m / f.max(1.0)).powi(2)).sqrt().max(0.005)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -163,6 +187,13 @@ pub struct Worker {
     pub stride: Stride,
     pub fallen_until: Option<f64>,
     work_left_s: f32,
+    /// The robots its eye saw a moment ago (`traffic::Noticed`).
+    pub noticed: Vec<traffic::Noticed>,
+    /// Where it believes it is: its own odometry, put right when its eye catches a flag (`fix_from_flags`). It moves by
+    /// the world's place for it, as the sub-workers always have; this is what it can tell another robot.
+    pub odom: Odometry,
+    /// What the wheels slipped on its last step, for its odometry.
+    slip_over: f32,
 }
 
 impl Worker {
@@ -199,6 +230,9 @@ impl Worker {
             stride: Stride::default(),
             fallen_until: None,
             work_left_s: 0.0,
+            noticed: Vec::new(),
+            odom: Odometry::new(crate::odometry::OdomCfg::exact(), id as u64, form.base() == BaseKind::HumanFoot, (x, z, yaw)),
+            slip_over: 0.0,
         }
     }
 
@@ -249,6 +283,14 @@ impl Worker {
     /// Its eye height (a humanoid's head, a lift truck rider's on the seat).
     pub fn eye_m(&self) -> f32 {
         kin::head_camera(&self.body, &KinPose::stand(&self.body, 0.0)).pos[2]
+    }
+
+    /// How far off its odometry may be by now (m, 1σ): the drift spec over what it travelled since a flag put it
+    /// right, the law the first worker's memory starts from before the SDS learns its own (`vision::DriftRate::spec`).
+    pub fn pose_sigma_m(&self) -> f32 {
+        let per_m = if self.form == Form::Humanoid { crate::odometry::LEG_SCALE_SD } else { crate::odometry::WHEEL_SCALE_SD };
+        let d = self.odom.since_fix_m;
+        ((per_m * d).powi(2) + crate::odometry::RANDOM_WALK_M.powi(2) * d).sqrt()
     }
 
     /// The pose its body is drawn in: a stride while it walks, the load held out in front of it.
@@ -398,7 +440,10 @@ impl World {
             });
             let Some((x, z)) = spot else { continue };
             let yaw = self.agent.yaw;
-            self.crew.push(Worker::new(id, form, cameras, x, z, yaw, &self.cfg.body, self.cfg.noto.fingers));
+            let mut w = Worker::new(id, form, cameras, x, z, yaw, &self.cfg.body, self.cfg.noto.fingers);
+            // It starts where it was put, and from there knows where it is only by its own odometry and the flags.
+            w.odom = Odometry::new(self.cfg.odometry, self.cfg.seed ^ (0xC2E_0000 + id as u64), form.base() == BaseKind::HumanFoot, (x, z, yaw));
+            self.crew.push(w);
             ids.push(id);
         }
         ids
@@ -507,11 +552,70 @@ impl World {
         self.worker_move(i, x, z, reach_m, &robots).or_else(|| self.worker_move(i, x, z, reach_m, &std::collections::HashSet::new()))
     }
 
-    /// Advances every sub-worker by `dt`.
+    /// Advances every sub-worker by `dt`, and what it believes of where it is.
     pub(crate) fn step_crew(&mut self, dt: f32, events: &mut Vec<TimedEvent>) {
         for i in 0..self.crew.len() {
+            let before = (self.crew[i].x, self.crew[i].z, self.crew[i].yaw);
             self.step_worker(i, dt, events);
+            let w = &mut self.crew[i];
+            let over = std::mem::take(&mut w.slip_over);
+            w.odom.update(before, (w.x, w.z, w.yaw), dt, over);
+            self.fix_from_flags(i);
         }
+    }
+
+    /// A sub-worker whose eye catches a flag (a fixed waypoint, not a loading bay) within `FLAG_FIX_RANGE_M` puts its
+    /// odometry right by it, as the first worker does (`noto_runtime::Runtime::relocalize_from`): a Kalman step between
+    /// what its drift says it may be off by and what its eye's range law says the look is worth.
+    fn fix_from_flags(&mut self, i: usize) {
+        let w = &self.crew[i];
+        let (at, dir, gaze, eye) = ((w.x, w.z), w.yaw, self.glance_rad(w.id), w.eye_m());
+        let half = traffic::SIGHT_HALF_FOV_DEG.to_radians();
+        let near = self
+            .waypoints
+            .iter()
+            .filter(|p| !p.key.starts_with("bay"))
+            .map(|p| (p, (p.x - at.0).hypot(p.z - at.1)))
+            .filter(|(p, d)| *d <= FLAG_FIX_RANGE_M && wrap((p.z - at.1).atan2(p.x - at.0) - (dir - gaze)).abs() <= half && self.line_of_sight(at, (p.x, p.z), eye.min(1.2)))
+            .map(|(_, d)| d)
+            .min_by(|a, b| a.total_cmp(b));
+        let Some(d) = near else { return };
+        let p_pose = w.pose_sigma_m().powi(2);
+        let p_obs = flag_look_sigma_m(&w.body, d).powi(2);
+        let k = p_pose / (p_pose + p_obs).max(1e-12);
+        // The look's own error: the same for the same robot, place and moment.
+        let n = |salt: u64| {
+            let h = crate::rng::hash2(self.cfg.seed ^ salt ^ w.id as u64, (w.x * 100.0) as i32, (self.time_s * 10.0) as i32);
+            ((h & 0xFFFF) as f32 / 65535.0 - 0.5) * 12f32.sqrt() * p_obs.sqrt() / std::f32::consts::SQRT_2
+        };
+        let (ex, ez) = (w.x - w.odom.x + n(0x51), w.z - w.odom.z + n(0xA7));
+        if k * ex.hypot(ez) > 1e-3 {
+            self.crew[i].odom.correct(k * ex, k * ez);
+        }
+    }
+
+    /// The sub-workers the first worker's head camera `cam` has in view now — inside its horizontal view (the neck's
+    /// pan included), within `FLAG_FIX_RANGE_M`, not behind a node — each with what it says of where it is and how
+    /// sure it is (`PeerSight`): a landmark that moves, for the first worker's odometry.
+    pub fn peers_in_view(&self, cam: &crate::render::Camera) -> Vec<PeerSight> {
+        let view = self.head_view(cam).view;
+        let (x, z, yaw) = (self.agent.x, self.agent.z, self.agent.yaw);
+        let half = 0.5 * cam.fov_deg.to_radians() - 0.05;
+        let eye = self.standing_eye_m();
+        self.crew
+            .iter()
+            .filter_map(|w| {
+                let (dx, dz) = (w.x - x, w.z - z);
+                let range_m = dx.hypot(dz);
+                let off = wrap(dz.atan2(dx) - view.yaw).abs();
+                (range_m <= FLAG_FIX_RANGE_M && off <= half && self.line_of_sight((x, z), (w.x, w.z), eye.min(1.2))).then(|| {
+                    let (s, c) = yaw.sin_cos();
+                    // Forward and left of the body (left is yaw − 90° on the map).
+                    let rel_m = (dx * c + dz * s, dx * s - dz * c);
+                    PeerSight { id: w.id, rel_m, range_m, said: (w.odom.x, w.odom.z), said_sigma_m: w.pose_sigma_m() }
+                })
+            })
+            .collect()
     }
 
     fn crew_event(&self, id: u32, kind: &str, label: String, item: Option<ItemKind>, amount: f32, ok: bool) -> TimedEvent {
@@ -551,6 +655,7 @@ impl World {
                 let was = (self.crew[i].x, self.crew[i].z);
                 let step = self.worker_step(i, &mut m, dt, events);
                 let w = &mut self.crew[i];
+                w.slip_over = step.slip_over;
                 w.walked_m += (w.x - was.0).hypot(w.z - was.1);
                 if step.lost {
                     let d = self.drops.last().map_or(String::new(), |d| drop_id(d.id));
@@ -669,8 +774,12 @@ impl World {
             Some(l) if (l.0 - w.x).hypot(l.1 - w.z) > 1e-3 => (l.1 - w.z).atan2(l.0 - w.x),
             _ => w.yaw,
         };
-        let me = traffic::Looker { id, at: (w.x, w.z), dir, half_w: w.footprint.half_w_m, front: w.footprint.front_m, speed: w.spec.max_speed_mps.min(1.0), eye_m: w.eye_m() };
-        let Some((other, gap)) = self.robot_in_way(&me, &path) else {
+        let me = traffic::Looker { id, at: (w.x, w.z), dir, half_w: w.footprint.half_w_m, front: w.footprint.front_m, speed: w.spec.max_speed_mps.min(1.0), eye_m: w.eye_m(), gaze: self.glance_rad(id) };
+        let seen = self.robots_seen(&me);
+        let now = self.time_s;
+        traffic::remember(&mut self.crew[i].noticed, seen, now);
+        let mind = self.crew[i].noticed.clone();
+        let Some((other, gap)) = self.robot_in_way(&me, &path, &mind) else {
             let w = &mut self.crew[i];
             w.held_s = 0.0;
             w.held_by = None;
@@ -1085,13 +1194,168 @@ mod tests {
             (c.x, c.z) = (x + 1.6, z);
         }
         let fp = w.footprint();
-        let me = |dir: f32| traffic::Looker { id: 1, at: (x, z), dir, half_w: fp.half_w_m, front: fp.front_m, speed: 1.0, eye_m: 1.4 };
+        let me = |dir: f32| traffic::Looker { id: 1, at: (x, z), dir, half_w: fp.half_w_m, front: fp.front_m, speed: 1.0, eye_m: 1.4, gaze: 0.0 };
         let line = |dir: f32| vec![(x + 3.0 * dir.cos(), z + 3.0 * dir.sin())];
-        assert_eq!(w.robot_in_way(&me(0.0), &line(0.0)).map(|s| s.0), Some(id), "in the open, on the way");
-        assert_eq!(w.robot_in_way(&me(std::f32::consts::PI), &line(std::f32::consts::PI)), None, "behind the eye: not seen");
-        assert_eq!(w.robot_in_way(&me(1.2), &line(1.2)), None, "the path passes clear of it: passed, not waited for");
+        assert_eq!(w.robot_in_way(&me(0.0), &line(0.0), &[]).map(|s| s.0), Some(id), "in the open, on the way");
+        assert_eq!(w.robot_in_way(&me(std::f32::consts::PI), &line(std::f32::consts::PI), &[]), None, "behind the eye: not seen");
+        assert_eq!(w.robot_in_way(&me(1.2), &line(1.2), &[]), None, "the path passes clear of it: passed, not waited for");
         w.nodes.push(Node { id: 700, kind: NodeKind::Tree, x: x + 0.9, z, hp: 3.0, max_hp: 3.0 });
         assert!(!w.line_of_sight((x, z), (x + 1.6, z), 1.2), "the trunk is in the line");
+    }
+
+    #[test]
+    fn off_the_ball_neck_scan_spots_side_hazards() {
+        let mut w = world();
+        w.nodes.clear();
+        let id = w.add_crew(&[Form::Humanoid], 1)[0];
+        let (x, z) = (w.agent.x, w.agent.z);
+        // Round a corner: the way goes 0.6 m ahead, then turns right (+z is a body's right going along +x); a robot
+        // stands just round it, 49° off the way.
+        {
+            let c = w.crew_worker_mut(id).unwrap();
+            (c.x, c.z) = (x + 0.6, z + 0.7);
+        }
+        let fp = w.footprint();
+        let me = |gaze: f32| traffic::Looker { id: 1, at: (x, z), dir: 0.0, half_w: fp.half_w_m, front: fp.front_m, speed: 1.0, eye_m: 1.4, gaze };
+        let path = vec![(x + 0.6, z), (x + 0.6, z + 1.5)];
+        // Looking along the way it is outside the 70° view, and the robot walks on into it.
+        assert!(w.robots_seen(&me(0.0)).is_empty());
+        assert_eq!(w.robot_in_way(&me(0.0), &path, &[]), None);
+        // A glance 25° to the left does not see it; one to the right catches it, and the way-ahead check stops for it.
+        let glance = noto_core::act::gaze::SCAN_PAN_DEG.to_radians();
+        assert!(w.robots_seen(&me(glance)).is_empty());
+        let seen = w.robots_seen(&me(-glance));
+        assert_eq!(seen.iter().map(|n| n.id).collect::<Vec<_>>(), vec![id]);
+        assert_eq!(w.robot_in_way(&me(-glance), &path, &[]).map(|s| s.0), Some(id));
+        // The head camera with the neck turned the same way looks where the eye's glance looks: its view turns by minus
+        // the pan on the map (`World::head_view`), as the eye does.
+        let pan = noto_core::kin::KinPose { neck_pan_deg: -noto_core::act::gaze::SCAN_PAN_DEG, ..noto_core::kin::KinPose::stand(&w.body, 0.0) };
+        let hc = noto_core::kin::head_camera(&w.body, &pan);
+        assert!((-hc.pan_deg.to_radians() - me(-glance).eye_dir()).abs() < 1e-5);
+        // With the head ahead again it stays in mind where it stood, until the next glance is due.
+        let mut mind = Vec::new();
+        traffic::remember(&mut mind, seen, w.time_s);
+        assert_eq!(w.robot_in_way(&me(0.0), &path, &mind).map(|s| s.0), Some(id));
+        w.time_s += traffic::NOTICE_KEEP_S as f64 + 0.1;
+        traffic::remember(&mut mind, Vec::new(), w.time_s);
+        assert!(mind.is_empty() && w.robot_in_way(&me(0.0), &path, &mind).is_none(), "an old glance is forgotten");
+        // One seen walking off the way is expected where it went, not where it was.
+        let walking = vec![traffic::Noticed { id, at: (x + 0.6, z + 0.7), vel: (1.5, 0.0), time_s: w.time_s - 1.0 }];
+        assert_eq!(w.robot_in_way(&me(0.0), &path, &walking), None);
+    }
+
+    #[test]
+    fn a_sub_worker_on_the_move_glances_each_way_and_the_first_worker_only_when_asked() {
+        let mut w = world();
+        w.nodes.clear();
+        w.drops.clear();
+        let id = w.add_crew(&[Form::Humanoid], 1)[0];
+        let (cx, cz) = {
+            let c = w.crew_worker(id).unwrap();
+            (c.x, c.z)
+        };
+        w.crew_command(id, Job::Go { x: cx + 6.0, z: cz, reach_m: 0.2 }).unwrap();
+        let (mut left, mut right) = (false, false);
+        for _ in 0..60 {
+            w.tick();
+            let g = w.glance_rad(id).to_degrees();
+            left |= g > 20.0;
+            right |= g < -20.0;
+        }
+        assert!(left && right, "it glanced both ways on its way");
+        w.scan_crew = false;
+        w.crew_command(id, Job::Go { x: cx, z: cz, reach_m: 0.2 }).unwrap();
+        for _ in 0..20 {
+            w.tick();
+            assert_eq!(w.glance_rad(id), 0.0);
+        }
+        // The first worker's head camera feeds its vision: it glances only when asked.
+        let (x, z) = (w.agent.x, w.agent.z);
+        let away = (0..8)
+            .map(|k| k as f32 * std::f32::consts::FRAC_PI_4)
+            .map(|a| (x + 4.0 * a.cos(), z + 4.0 * a.sin()))
+            .find(|t| w.clone().command(crate::world::Action::MoveTo { x: t.0, z: t.1, reach_m: 0.0 }).is_ok())
+            .expect("somewhere to go");
+        w.command(crate::world::Action::MoveTo { x: away.0, z: away.1, reach_m: 0.0 }).unwrap();
+        let mut glanced = false;
+        for _ in 0..300 {
+            w.tick();
+            glanced |= w.glance_rad(1) != 0.0;
+            if !w.busy() {
+                break;
+            }
+        }
+        assert!(!glanced);
+        w.scan_first = true;
+        w.command(crate::world::Action::MoveTo { x, z, reach_m: 0.0 }).unwrap();
+        for _ in 0..30 {
+            w.tick();
+            glanced |= w.glance_rad(1).abs() > 0.3;
+        }
+        assert!(glanced);
+    }
+
+    #[test]
+    fn the_first_worker_sees_a_peer_where_it_stands_with_what_it_says_of_itself() {
+        let mut w = world();
+        w.nodes.clear();
+        let id = w.add_crew(&[Form::Humanoid], 1)[0];
+        let (x, z, yaw) = (w.agent.x, w.agent.z, w.agent.yaw);
+        let put = |w: &mut World, fwd: f32, left: f32| {
+            let (s, c) = yaw.sin_cos();
+            let c2 = w.crew_worker_mut(id).unwrap();
+            (c2.x, c2.z) = (x + fwd * c + left * s, z + fwd * s - left * c);
+        };
+        let cam = crate::render::Camera::default();
+        put(&mut w, 3.0, 0.8);
+        let seen = w.peers_in_view(&cam);
+        assert_eq!(seen.len(), 1);
+        assert!((seen[0].rel_m.0 - 3.0).abs() < 1e-4 && (seen[0].rel_m.1 - 0.8).abs() < 1e-4, "{:?}", seen[0]);
+        let c = w.crew_worker(id).unwrap();
+        assert_eq!(seen[0].said, (c.odom.x, c.odom.z));
+        // Behind the head, or past the flags' reach, it is not a landmark.
+        put(&mut w, -3.0, 0.0);
+        assert!(w.peers_in_view(&cam).is_empty());
+        put(&mut w, FLAG_FIX_RANGE_M + 0.5, 0.0);
+        assert!(w.peers_in_view(&cam).is_empty());
+    }
+
+    #[test]
+    fn a_sub_worker_drifts_on_its_own_odometry_and_a_flag_in_view_puts_it_right() {
+        let mut w = World::new(WorldConfig { seed: 3, parcels: Some(0), terrain: TerrainKind::Open, odometry: crate::odometry::OdomCfg { enabled: true, scale: 4.0 }, ..WorldConfig::default() }).unwrap();
+        w.nodes.clear();
+        w.drops.clear();
+        let flags: Vec<(f32, f32)> = w.waypoints.iter().filter(|p| !p.key.starts_with("bay")).map(|p| (p.x, p.z)).collect();
+        let id = w.add_crew(&[Form::Humanoid], 1)[0];
+        let err = |w: &World| {
+            let c = w.crew_worker(id).unwrap();
+            ((c.odom.x - c.x).hypot(c.odom.z - c.z), c.pose_sigma_m(), c.odom.since_fix_m)
+        };
+        assert_eq!(err(&w).0, 0.0, "it starts where it was put");
+        // Walking away from every flag, its belief drifts and its σ grows with the distance.
+        let (cx, cz) = {
+            let c = w.crew_worker(id).unwrap();
+            (c.x, c.z)
+        };
+        let far = (0..16)
+            .map(|k| k as f32 * std::f32::consts::TAU / 16.0)
+            .map(|a| (cx + 8.0 * a.cos(), cz + 8.0 * a.sin()))
+            .filter(|t| w.terrain.cell_of(t.0, t.1).is_some())
+            .max_by(|a, b| {
+                let d = |t: &(f32, f32)| flags.iter().map(|f| (f.0 - t.0).hypot(f.1 - t.1)).fold(f32::INFINITY, f32::min);
+                d(a).total_cmp(&d(b))
+            })
+            .unwrap();
+        w.crew_command(id, Job::Go { x: far.0, z: far.1, reach_m: 0.3 }).unwrap();
+        assert!(run(&mut w, id, 60.0).0);
+        let (drift, sigma, travelled) = err(&w);
+        assert!(travelled > 4.0 && sigma > 0.05 && drift > 0.0, "{drift} {sigma} {travelled}");
+        // Back to a flag: once its eye catches it near enough, the belief comes back close to where it is.
+        let flag = flags.iter().min_by(|a, b| (a.0 - far.0).hypot(a.1 - far.1).total_cmp(&(b.0 - far.0).hypot(b.1 - far.1))).copied().unwrap();
+        w.crew_command(id, Job::Go { x: flag.0, z: flag.1, reach_m: 2.0 }).unwrap();
+        assert!(run(&mut w, id, 90.0).0);
+        let (after, sigma_after, _) = err(&w);
+        assert!(sigma_after < sigma && after < drift.max(0.05), "{after} vs {drift}; σ {sigma_after} vs {sigma}");
     }
 
     #[test]

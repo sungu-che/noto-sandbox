@@ -14,6 +14,44 @@ pub const HEAD_CAMERA_MOUNT_DEG: f32 = -12.0;
 pub const HEAD_PEAK_DPS: f32 = 150.0;
 pub const LOOK_MIN_S: f32 = 0.15;
 pub const FIXATE_S: f32 = 0.35;
+/// Off-the-ball scanning: a footballer without the ball turns the head away from the play every second or so to see
+/// who is around before it matters, quick turns held only long enough to see. A robot on the move with nothing in its
+/// hands does the same with its neck while its body goes on the way it goes: every `SCAN_PERIOD_S` the head turns
+/// `SCAN_PAN_DEG` to one side (the other side the next time), holds a fixation and comes back [추정: the period is the
+/// intermittent look cadence of the robot's vision, 1.5 s; the turn keeps the way ahead inside a 70° camera's view].
+pub const SCAN_PERIOD_S: f32 = 1.5;
+pub const SCAN_PAN_DEG: f32 = 25.0;
+
+/// The neck's pan of an off-the-ball scan `t_s` into the schedule (deg, left positive): ahead most of the period, then
+/// a min-jerk turn out at the neck's speed, a fixation and a turn back, ending with the period. Each period turns to the
+/// other side. Zero for a head that cannot pan, or not fast enough to be back within a period.
+pub fn scan_pan_deg(body: &Body, t_s: f32) -> f32 {
+    let pan_max = body.head_range_deg().1;
+    if pan_max <= 0.0 || t_s < 0.0 {
+        return 0.0;
+    }
+    let pan = SCAN_PAN_DEG.min(pan_max);
+    let peak = body.head.neck.speed_rad_s.to_degrees().min(HEAD_PEAK_DPS).max(30.0);
+    let turn = (MIN_JERK_PEAK * pan / peak).max(LOOK_MIN_S);
+    let glance = 2.0 * turn + FIXATE_S;
+    if glance >= SCAN_PERIOD_S {
+        return 0.0;
+    }
+    let k = (t_s / SCAN_PERIOD_S).floor();
+    let tau = t_s - k * SCAN_PERIOD_S - (SCAN_PERIOD_S - glance);
+    if tau < 0.0 {
+        return 0.0;
+    }
+    let side = if (k as i64).rem_euclid(2) == 0 { 1.0 } else { -1.0 };
+    let u = if tau < turn {
+        min_jerk(tau / turn)
+    } else if tau < turn + FIXATE_S {
+        1.0
+    } else {
+        min_jerk((1.0 - (tau - turn - FIXATE_S) / turn).clamp(0.0, 1.0))
+    };
+    side * pan * u
+}
 
 pub fn can_aim(body: &Body) -> bool {
     body.head_range_deg().0 > 0.0
@@ -150,5 +188,27 @@ mod tests {
         assert!(r.events.iter().any(|e| e.kind == "gaze_fix") && r.events.iter().any(|e| e.kind == "vision_check"));
         let side = look(&b, &b.stand(0.0), [0.6, 0.5, 0.075]);
         assert!(side.samples.last().unwrap().pose.neck_pan_deg > 20.0, "it turns the head to an object beside it");
+    }
+
+    #[test]
+    fn an_off_the_ball_scan_glances_to_each_side_in_turn_and_mostly_looks_ahead() {
+        let b = body(BaseKind::HumanFoot);
+        let pans: Vec<f32> = (0..300).map(|i| scan_pan_deg(&b, i as f32 * 0.01)).collect();
+        // Ahead at the start of a period, a glance to the left at the end of the first, to the right in the second.
+        assert_eq!(pans[0], 0.0);
+        let first = pans[..150].iter().copied().fold(f32::MIN, f32::max);
+        let second = pans[150..].iter().copied().fold(f32::MAX, f32::min);
+        assert!((first - SCAN_PAN_DEG).abs() < 1e-3 && (second + SCAN_PAN_DEG).abs() < 1e-3, "{first} {second}");
+        assert!(pans[..150].iter().all(|p| *p >= 0.0) && pans[150..].iter().all(|p| *p <= 0.0));
+        // The head is back ahead by the end of each period, and looks ahead for well over a third of it.
+        assert!(scan_pan_deg(&b, SCAN_PERIOD_S - 1e-4).abs() < 0.5);
+        let ahead = pans.iter().filter(|p| p.abs() < 1e-3).count() as f32 / pans.len() as f32;
+        assert!(ahead > 0.35, "{ahead}");
+        // It turns no faster than the neck turns a look.
+        let rate = pans.windows(2).map(|w| (w[1] - w[0]).abs() / 0.01).fold(0.0f32, f32::max);
+        assert!(rate <= 1.05 * HEAD_PEAK_DPS, "{rate}");
+        // A head with no neck does not scan.
+        let fixed = Body::new(&BodyPlan { morph: crate::morph::Morphology::named("wheel_noneck").unwrap(), ..BodyPlan::default() }, BaseKind::Wheel, FingerCount::Five);
+        assert!((0..300).all(|i| scan_pan_deg(&fixed, i as f32 * 0.01) == 0.0));
     }
 }
