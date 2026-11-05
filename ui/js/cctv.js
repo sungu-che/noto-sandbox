@@ -25,6 +25,9 @@ const ANGLES = 12; // 고리 하나의 자리 수
 const CAPTION = { rgb: '1인칭', depth: '깊이', fork: '포크 카메라' };
 
 const bubbles = new Map(); // id → 말풍선
+const fans = new Map(); // id → 시야 부채꼴 (svg path)
+let callplay = null; // 작업자 1 ↔ 위치를 고쳐 준 동료 (svg line)
+const noticedLines = []; // 고른 유닛이 곁눈질로 본 로봇들
 let lines = null;
 let busy = false;
 let retryAt = 0;
@@ -125,12 +128,73 @@ function setStatusText(node, text) {
 /** 로봇 자리: 말풍선이 다른 로봇을 덮지 않게 비켜 갈 영역. */
 const robotBox = (ax, ay) => ({ x: ax - 16, y: ay - PIN_UP - 10, w: 32, h: PIN_UP + 24 });
 
+/**
+ * 시야 부채꼴: 로봇의 눈이 지금 보는 쪽(몸 방향 + 이동 중 곁눈질)의 수평 화각과 사거리. u.sight 는 프레임 그림 위의 방향
+ * (dir_deg: x 오른쪽 · y 아래), 반각, 사거리(m)이고 프레임의 px_per_m 로 화면 크기로 바꾼다. 곁눈질 중이면 노랗게.
+ */
+function drawSight(u, ax, ay, f, isSel) {
+  let p = fans.get(u.id);
+  const s = u.sight;
+  const k = state.frame?.px_per_m && state.frame.width ? (state.frame.px_per_m * f.width) / state.frame.width : 0;
+  if (!s || !k) {
+    p?.remove();
+    fans.delete(u.id);
+    return;
+  }
+  if (!p) {
+    p = svgEl('path', {});
+    lines.prepend(p);
+    fans.set(u.id, p);
+  }
+  const r = s.range_m * k;
+  const a0 = ((s.dir_deg - s.half_deg) * Math.PI) / 180;
+  const a1 = ((s.dir_deg + s.half_deg) * Math.PI) / 180;
+  const pt = (a) => `${(ax + r * Math.cos(a)).toFixed(1)} ${(ay + r * Math.sin(a)).toFixed(1)}`;
+  p.setAttribute('d', `M ${ax.toFixed(1)} ${ay.toFixed(1)} L ${pt(a0)} A ${r.toFixed(1)} ${r.toFixed(1)} 0 0 1 ${pt(a1)} Z`);
+  p.setAttribute('class', `sight${Math.abs(s.glance_deg ?? 0) > 1 ? ' glance' : ''}${isSel ? ' sel' : ''}`);
+}
+
+/** 두 로봇 사이의 선: 콜플레이(동료를 기준점으로 고친 위치) · 곁눈질로 본 로봇. */
+function link(line, a, b, cls, title) {
+  for (const [k, v] of [['x1', a[0]], ['y1', a[1]], ['x2', b[0]], ['y2', b[1]]]) line.setAttribute(k, v.toFixed(1));
+  line.setAttribute('class', cls);
+  line.replaceChildren(svgEl('title', {}));
+  line.firstChild.textContent = title;
+}
+
+function drawLinks(units, at) {
+  const where = new Map(units.map((u) => [u.id, at(u)]));
+  // 작업자 1 이 최근에 동료를 움직이는 기준점으로 자기 위치를 고쳤으면 그 둘을 잇는다.
+  const fix = state.relay?.peer_fix;
+  const [a, b] = [where.get(1), fix && where.get(fix.peer)];
+  if (a && b) {
+    callplay = callplay ?? lines.appendChild(svgEl('line', {}));
+    link(callplay, a, b, 'callplay', `콜플레이: 작업자 ${fix.peer} 를 기준점으로 ${fmt.n(fix.gap_m * 100, 0)} cm 중 ${fmt.n(fix.gain * 100, 0)}% 고침`);
+  } else {
+    callplay?.remove();
+    callplay = null;
+  }
+  // 고른 유닛이 곁눈질로 보고 아직 기억하는 로봇들.
+  const sel = units.find((u) => u.id === state.selectedUnit);
+  const seen = (sel?.noticed ?? []).filter((id) => where.has(id));
+  while (noticedLines.length > seen.length) noticedLines.pop().remove();
+  while (noticedLines.length < seen.length) noticedLines.push(lines.appendChild(svgEl('line', {})));
+  seen.forEach((id, i) => link(noticedLines[i], where.get(sel.id), where.get(id), 'noticed', `작업자 ${sel.id} 가 본 작업자 ${id}`));
+}
+
 /** 프레임마다: 말풍선을 만들고 지우고, 자리를 잡고, 글자를 맞춘다. */
 function sync() {
   const units = topView() ? state.units : [];
   const showBubbles = state.toggles.cctv;
   const live = new Set(units.map((u) => u.id));
   for (const b of [...bubbles.values()]) if (!live.has(b.id)) dropBubble(b);
+  for (const [id, p] of [...fans]) {
+    if (!live.has(id) || !showBubbles) {
+      p.remove();
+      fans.delete(id);
+    }
+  }
+  if (!units.length || !showBubbles) drawLinks([], () => [0, 0]);
   if (!units.length) return;
   const sel = state.selectedUnit;
   const crowded = units.length > CROWD;
@@ -156,13 +220,18 @@ function sync() {
     b.node.hidden = !showBubbles;
     b.line.style.display = showBubbles ? '' : 'none';
     if (!showBubbles) continue;
+    drawSight(u, ax, ay, f, isSel);
     b.node.classList.toggle('sel', isSel);
     b.node.classList.toggle('compact', crowded && !isSel);
-    setStatusText(b.status, u.fallen ? '넘어짐' : u.status_ko ?? '');
+    // 작업자 1 이 손에 든 짐이 손안에서 밀렸으면 그것이 전신에 준 것을 상태 줄에 붙인다.
+    const slide = u.first ? state.relay?.slide : null;
+    const slid = slide && Math.hypot(slide.shift_m[0], slide.shift_m[1]) >= 0.005 ? ` · 짐 쏠림 ${fmt.n(slide.shift_m[0] * 100, 1)} cm → ZMP ${fmt.n(slide.zmp_shift_m * 1000, 1)} mm` : '';
+    setStatusText(b.status, u.fallen ? '넘어짐' : `${u.status_ko ?? ''}${slid}`);
     const r = placeOne(b, ax, ay, placed, blocked, W, H);
     b.node.style.transform = `translate(${r.x.toFixed(1)}px, ${r.y.toFixed(1)}px)`;
     drawLine(b, ax, ay, r, isSel);
   }
+  if (showBubbles) drawLinks(units, at);
 }
 
 // ── 타일 받기 ───────────────────────────────────────────────────

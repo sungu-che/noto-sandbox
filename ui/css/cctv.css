@@ -3,6 +3,13 @@
 .cctv-lines { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 .cctv-lines line { stroke: rgba(250, 250, 250, 0.45); stroke-width: 1; stroke-dasharray: 3 3; }
 .cctv-lines line.sel { stroke: var(--warning); stroke-dasharray: none; }
+/* 로봇마다 눈의 시야(카메라 수평 화각 · 사거리)와, 이동 중 곁눈질(오프더볼 스캔)로 돌아간 방향. */
+.cctv-lines path.sight { fill: rgba(96, 178, 255, 0.07); stroke: rgba(96, 178, 255, 0.4); stroke-width: 1; }
+.cctv-lines path.sight.glance { fill: rgba(255, 196, 72, 0.12); stroke: rgba(255, 196, 72, 0.7); }
+.cctv-lines path.sight.sel { stroke-width: 1.6; }
+/* 콜플레이: 작업자 1 이 동료를 움직이는 기준점으로 자기 위치를 고친 선, 곁눈질로 본 로봇. */
+.cctv-lines line.callplay { stroke: #3ad29f; stroke-width: 2; stroke-dasharray: 6 3; }
+.cctv-lines line.noticed { stroke: rgba(255, 196, 72, 0.6); stroke-width: 1; stroke-dasharray: 1 3; }
 
 .unit-tag-pin {
   position: absolute; left: 0; top: 0; min-width: 22px; height: 16px; margin: -8px 0 0 -11px; padding: 0 4px;

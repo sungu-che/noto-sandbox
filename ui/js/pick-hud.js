@@ -8,8 +8,32 @@
 // 읽은 물건의 놓인 각도·크기를 적으며, 자세를 낮추고 쥐고 드는 동안 팔 관절과 손가락 패드 접촉을 함께 그린다.
 import { $, clear, el, fmt } from './util.js';
 import { drawFocus } from './focus-view.js';
+import { state } from './state.js';
 
 const STATE_KO = { done: '완료', active: '진행', pending: '대기', failed: '실패' };
+const PADS_KO = { dry: '마른 패드', wet: '젖은 패드', dusty: '먼지 낀 패드' };
+const signed = (v, d) => `${v >= 0 ? '+' : ''}${fmt.n(v, d)}`;
+
+/**
+ * 물리 · SDS 되먹임(world_frame.relay): 이 물건을 쥘 때 손이 기억하는 마찰(그 물건 · 패드 상태로 겪은 미세 미끄럼에서
+ * 배운 사전값, 학습 전이면 표 그대로)과, 손에 든 짐이 손안에서 밀려 전신에 준 것(ZMP · 어깨 부하).
+ */
+function relayLines(p, r) {
+  const out = [];
+  const g = r?.grip;
+  if (g && p?.mechanism === 'hand') {
+    const pads = PADS_KO[g.pads] ?? g.pads;
+    const felt = g.grasps ? ` · 미세 미끄럼 ${fmt.n(g.slip_rate * 100, 0)}%${g.mu_seen != null ? ` · 읽은 마찰 ${fmt.n(g.mu_seen, 2)}` : ''} · ${g.grasps}회` : '';
+    out.push(g.mu < g.table_mu - 1e-3
+      ? `손이 기억하는 마찰 · ${g.item_ko}(${pads}) 표 ${fmt.n(g.table_mu, 2)} → ${fmt.n(g.mu, 2)} 로 더 세게 쥠${felt}`
+      : `손이 기억하는 마찰 · ${g.item_ko}(${pads}) 표 ${fmt.n(g.table_mu, 2)} 그대로${g.learning ? ` (학습 중 ${g.grasps}/${g.min_grasps}회)` : ''}${felt}`);
+  }
+  const s = r?.slide;
+  if (s && Math.hypot(s.shift_m[0], s.shift_m[1]) >= 0.005) {
+    out.push(`손안 짐 쏠림 ${signed(s.shift_m[0] * 100, 1)} cm → ZMP ${signed(s.zmp_shift_m * 1000, 1)} mm · 어깨 부하 ${fmt.n(s.shoulder_ratio_held * 100, 0)} → ${fmt.n(s.shoulder_ratio * 100, 0)}%`);
+  }
+  return out;
+}
 
 function stageRow(s) {
   return el('li', { class: `ph-stage ${s.state}`, title: s.note ?? '' },
@@ -228,6 +252,12 @@ export function renderPickHud(p, focus = null) {
     const line = show && p.mechanism === 'hand' ? itemLine(p.check?.item) : '';
     itemBox.hidden = !line;
     itemBox.textContent = line ? `깊이로 읽은 물건 · ${line}` : '';
+  }
+  const relayBox = $('ph-relay');
+  if (relayBox) {
+    const rows = show ? relayLines(p, state.relay) : [];
+    relayBox.hidden = !rows.length;
+    relayBox.replaceChildren(...rows.map((t) => el('div', { text: t })));
   }
   const cam = $('ph-forkcam-box');
   if (cam) {

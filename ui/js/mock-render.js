@@ -245,10 +245,18 @@ function drawTopView(ctx, w, h, W) {
   for (const u of unitRows()) drawRobot(ctx, u, X, Y, s);
 }
 
-/** world_frame.units: 탑뷰 프레임 안의 로봇 자리. */
+/**
+ * world_frame.units: 탑뷰 프레임 안의 로봇 자리와 눈의 시야(sight: 그림 위 방향 x 오른쪽 · y 아래, 반각, 사거리).
+ * 이 탑뷰는 y 가 위로 그려지므로 그림 위 방향은 −yaw 이고, 서브 작업자는 Rust 처럼 이동 중 1.5 s 마다 번갈아 곁눈질한다.
+ */
 function topUnits(w, h, W) {
   const { X, Y } = topMap(w, h, W);
-  return unitRows().map(({ pos, yaw, battery_ratio, rig_id, rig_name_ko, ...u }) => ({ ...u, u: X(pos[0]) / w, v: Y(pos[1]) / h, yaw_deg: (yaw * 180) / Math.PI }));
+  return unitRows().map(({ pos, yaw, battery_ratio, rig_id, rig_name_ko, ...u }) => {
+    const beat = ((W.tick ?? 0) * 0.1 + u.id * 0.61) % 3;
+    const glance = !u.first && u.moving ? (beat > 1.1 && beat < 1.5 ? 25 : beat > 2.6 ? -25 : 0) : 0;
+    // A turn to the body's left (+) is counter-clockwise on this y-up map: on the picture, minus the yaw and the turn.
+    return { ...u, u: X(pos[0]) / w, v: Y(pos[1]) / h, yaw_deg: (yaw * 180) / Math.PI, sight: { dir_deg: -(yaw * 180) / Math.PI - glance, half_deg: 35, range_m: 6, glance_deg: glance }, noticed: [] };
+  });
 }
 
 function canvasFor(w, h) {
@@ -399,6 +407,8 @@ export function renderFrame({ width, height, quality, view }) {
   const eyeDepth = view === 'eye_depth' ? { source: 'sgbm', valid: 0.81, scale_m: [0.4, 3.2], ms: 0, grid: [w, h], box: [0.36, 0.4, 0.64, 0.64], box_valid: 0.72, box_depth_m: 0.68, item: null } : null;
   return {
     webp_base64: b64, width: w, height: h, bytes: Math.floor((b64.length * 3) / 4) - pad, encode_ms, tick: W.tick, detections, camera, procedure,
+    px_per_m: view === 'top' ? topMap(w, h, W).s : null,
+    relay: null,
     units: view === 'top' ? topUnits(w, h, W) : [],
     overlay: view.startsWith('chase') ? mockOverlay(w, h) : eyeDepth,
     focus: view.startsWith('focus') || handsBusy ? mockFocus() : null,

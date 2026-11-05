@@ -125,4 +125,7 @@
 .ph-view.ph-wide canvas { aspect-ratio: 2 / 1; }
 .ph-view figcaption { position: absolute; left: 5px; top: 4px; right: 5px; font-size: 0.56rem; color: #fff; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8); pointer-events: none; }
 .ph-item { margin-top: 4px; padding: 2px 6px; font-size: 0.6rem; line-height: 1.4; color: var(--text-bright); border-left: 3px solid var(--accent-strong); background: rgba(255, 255, 255, 0.03); overflow-wrap: anywhere; }
+/* 물리 · SDS 되먹임: 손이 기억하는 마찰, 손안 짐 쏠림이 전신에 준 것. */
+.ph-relay { margin-top: 5px; padding: 2px 6px; font-size: 0.6rem; line-height: 1.45; color: var(--text-bright); border-left: 3px solid #3ad29f; background: rgba(58, 210, 159, 0.06); overflow-wrap: anywhere; }
+.ph-relay div + div { margin-top: 1px; }
 .ph-forkcam.blocked canvas { border-color: var(--warning); box-shadow: 0 0 0 1px var(--warning); }

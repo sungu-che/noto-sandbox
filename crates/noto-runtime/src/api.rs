@@ -635,6 +635,12 @@ impl Runtime {
             .collect();
         let camera = matches!(view_id, "agent").then(|| self.head_view_json());
         let procedure = matches!(view_id, "agent").then(|| self.procedure_json()).flatten();
+        // The top view draws the whole map scaled into the frame (`render_map`): its frame pixels per metre, for the
+        // robots' sight fans.
+        let px_per_m = (view == FrameView::Top).then(|| {
+            let (sx, sz) = self.world().terrain.size_m();
+            1.0 / (sx / f.width as f32).max(sz / f.height as f32).max(1e-6)
+        });
         Ok(json!({
             "webp_base64": STANDARD.encode(&f.webp),
             "width": f.width, "height": f.height, "bytes": f.bytes,
@@ -646,7 +652,31 @@ impl Runtime {
             "procedure": procedure,
             "light": crate::views::light_json(self.world()),
             "units": units,
+            "px_per_m": px_per_m.map(r3),
+            "relay": self.relay_json(),
         }))
+    }
+
+    /// What the first worker's physics and its own feel pass back into how it acts, for the screen: the grip it plans
+    /// for the item in its hands (its learned friction, `relay`), what a load slid in its hands does to its whole body
+    /// (`World::slide_relay`), the last time a sub-worker in view put its pose right, and its head's glance.
+    fn relay_json(&self) -> Value {
+        let w = self.world();
+        let grip = w.act.as_ref().filter(|p| p.rollout.kind == noto_core::act::ActKind::Grasp).and_then(|p| Some((p.object?.0, p.pads?))).map(|(item, pads)| {
+            let table = w.pad_mu(item);
+            let feel = crate::relay::grip_feel(&self.sds, item.id(), pads);
+            let prior = crate::relay::grip_prior(&self.sds, item.id(), pads, table);
+            json!({"item": item.id(), "item_ko": item.spec().label_ko, "pads": pads, "table_mu": r3(table), "mu": r3(prior.map_or(table, |p| p.mu)),
+                "slip_rate": r3(feel.slip_rate), "mu_seen": feel.mu_seen.map(r3), "grasps": feel.grasps, "learning": prior.is_none(), "min_grasps": crate::relay::GRIP_PRIOR_MIN_N})
+        });
+        let fix = self.last_peer_fix.filter(|f| w.time_s - f.time_s <= 6.0).map(|f| json!({"peer": f.peer, "gap_m": r3(f.gap_m), "gain": r3(f.gain), "age_s": r3((w.time_s - f.time_s) as f32)}));
+        json!({"grip": grip, "slide": w.slide_relay(), "peer_fix": fix, "glance_deg": r3(w.glance_rad(1).to_degrees())})
+    }
+
+    /// A robot's eye on the top view: where it looks on the picture (x right, y down: its yaw less its glance, the
+    /// way the head camera turns), the half of its view and how far it looks (`traffic::SIGHT_*`).
+    fn sight_json(yaw: f32, glance: f32) -> Value {
+        json!({"dir_deg": r3((yaw - glance).to_degrees()), "half_deg": world_sim::world::traffic::SIGHT_HALF_FOV_DEG, "range_m": world_sim::world::traffic::SIGHT_RANGE_M, "glance_deg": r3(glance.to_degrees())})
     }
 
     /// One robot for the screen: where it is, what it does, what it carries.
@@ -660,13 +690,16 @@ impl Runtime {
             json!({"id": 1, "first": true, "form": world_sim::crew::Form::of_base(self.cfg.noto.base).id(), "base": self.cfg.noto.base, "label_ko": world_sim::crew::Form::of_base(self.cfg.noto.base).label_ko(),
                 "x": r3(w.agent.x), "z": r3(w.agent.z), "yaw_deg": r3(w.agent.yaw.to_degrees()), "moving": w.agent.speed_mps > 0.01, "fallen": w.fallen_until.is_some_and(|t| w.time_s < t),
                 "status_ko": w.current_action().unwrap_or_else(|| "대기".to_string()), "carried_kg": r3(w.carried_kg()), "capacity_kg": r3(w.capacity_kg()), "battery_ratio": r3(w.battery_ratio()),
-                "load": load(&s.agent.carrying), "cameras": self.cameras(), "rig_id": rig_id, "rig_name_ko": rig_name})
+                "load": load(&s.agent.carrying), "cameras": self.cameras(), "rig_id": rig_id, "rig_name_ko": rig_name,
+                "sight": Self::sight_json(w.agent.yaw, w.glance_rad(1)), "noticed": w.noticed.iter().map(|n| n.id).collect::<Vec<_>>()})
         } else {
             let c = w.crew_worker(id)?;
             let (rig_id, rig_name) = rig(c.body.plan.build, c.body.base);
             json!({"id": id, "first": false, "form": c.form.id(), "base": c.body.base, "label_ko": c.form.label_ko(), "x": r3(c.x), "z": r3(c.z), "yaw_deg": r3(c.yaw.to_degrees()), "moving": c.speed_mps > 0.01,
                 "fallen": c.fallen_until.is_some_and(|t| w.time_s < t), "status_ko": c.status_ko(), "carried_kg": r3(c.carried_kg()), "capacity_kg": r3(c.capacity_kg), "battery_ratio": 1.0,
-                "load": load(&c.carry_views()), "cameras": c.cameras, "rig_id": rig_id, "rig_name_ko": rig_name})
+                "load": load(&c.carry_views()), "cameras": c.cameras, "rig_id": rig_id, "rig_name_ko": rig_name,
+                "sight": Self::sight_json(c.yaw, w.glance_rad(id)), "noticed": c.noticed.iter().map(|n| n.id).collect::<Vec<_>>(),
+                "pose_sigma_m": r3(c.pose_sigma_m()), "belief_err_m": r3((c.odom.x - c.x).hypot(c.odom.z - c.z))})
         };
         Some(v)
     }

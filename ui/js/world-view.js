@@ -80,9 +80,12 @@ async function drawFrame(f) {
   canvas.getContext('2d').drawImage(img, 0, 0, f.width, f.height);
   img.close?.();
   const sizeChanged = !state.frame || state.frame.width !== f.width || state.frame.height !== f.height;
-  state.frame = { width: f.width, height: f.height, bytes: f.bytes, encode_ms: f.encode_ms, tick: f.tick };
+  // px_per_m: the top view's scale (frame pixels per metre), for the robots' sight fans.
+  state.frame = { width: f.width, height: f.height, bytes: f.bytes, encode_ms: f.encode_ms, tick: f.tick, px_per_m: f.px_per_m ?? null };
   state.detections = f.detections ?? [];
   state.units = f.units ?? [];
+  // 물리 · SDS 되먹임(작업자 1): 손이 기억하는 마찰, 손안 짐 쏠림, 동료로 고친 위치.
+  state.relay = f.relay ?? null;
   // 3인칭: 관절 물리 오버레이(Rust 가 픽셀로 투영한 관절·CoM·ZMP). 표와 부위 그림은 유닛 HUD 에서.
   const chase = !!f.overlay;
   $('joint-layer').hidden = !chase;
