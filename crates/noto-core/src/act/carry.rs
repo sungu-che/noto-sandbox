@@ -400,4 +400,68 @@ mod tests {
         let b = truck();
         assert!(curb_shock(&b, 0.05, 1.0).a_z > 3.0 * curb_shock(&b, 0.05, 0.3).a_z);
     }
+
+    #[test]
+    fn cargo_shift_relays_to_zmp_and_toe_patch() {
+        use crate::act::cocarry;
+        use crate::balance::{FeedForward, Posture, Source};
+        use crate::kin::{self, KinLoads};
+        use crate::parts::Tier;
+        // A mid walker with a 2.4 kg log in both hands, 35 cm before its body.
+        let b = Body::new(&BodyPlan::uniform(Tier::Mid), BaseKind::HumanFoot, FingerCount::Five);
+        let pose = cocarry::carry_pose(&b, cocarry::carry_hand_z(&b));
+        let arms = (pose.shoulder_deg, pose.elbow_deg);
+        let ff = FeedForward::default();
+        let brake_at = |a: f32| Posture { source: Source::Accel, accel_mps2: -a, moving: true, ..Posture::quiet(2.4) };
+        // Hard braking (1.5 m/s²) is fine for the load in the bay, where the models used to put it, and runs the ZMP off
+        // the toes for the load in the hands, where it is.
+        assert!(b.solve(&brake_at(1.5), &ff, 1e3).margin > 0.2);
+        assert!(b.solve(&brake_at(1.5).held_in_hands(arms, [0.0, 0.0]), &ff, 1e3).margin < 0.0);
+        // So a walker carrying in its hands plans its stops for the load there. With a log the stop it ramps to anyway
+        // (top speed in half a second) is the gentler; a heavier load in the hands leaves less room than that.
+        let firm = crate::surface::Surface::Firm;
+        let plan = |kg: f32, hands: bool| {
+            let limits = b.drive_limits(&BaseKind::HumanFoot.spec(), kg);
+            let from = if hands { b.quiet(kg).held_in_hands(arms, [0.0, 0.0]) } else { b.quiet(kg) };
+            b.planned_accel_from(&limits, &from, 0.0, firm, -1.0, 0.5)
+        };
+        let in_hands = plan(2.4, true);
+        assert!(in_hands <= plan(2.4, false) + 1e-6 && in_hands > 0.2, "{in_hands}");
+        for kg in [4.0, 6.0] {
+            assert!(plan(kg, true) < 0.8 * plan(kg, false), "{kg} kg: {} vs {}", plan(kg, true), plan(kg, false));
+        }
+        // It brakes at that, and the log slides 4 cm forward in its hands.
+        let braking = brake_at(in_hands);
+        let bay = b.solve(&braking, &ff, 1e3);
+        let held = b.solve(&braking.held_in_hands(arms, [0.0, 0.0]), &ff, 1e3);
+        let slid = b.solve(&braking.held_in_hands(arms, [0.04, 0.0]), &ff, 1e3);
+        assert!(held.margin >= 0.0, "{}", held.margin);
+        let shoulder = |r: &crate::balance::BalanceReport| r.joint("shoulder_r").map_or(0.0, |j| j.peak_ratio);
+        // In the bay the arms hang empty; in the hands they hold it, and more the further out it slid.
+        assert!(shoulder(&held) > shoulder(&bay) + 0.05, "{} vs {}", shoulder(&held), shoulder(&bay));
+        assert!(shoulder(&slid) > shoulder(&held), "{} vs {}", shoulder(&slid), shoulder(&held));
+        assert!(slid.cargo_x_m > held.cargo_x_m + 0.039 && held.cargo_x_m > bay.cargo_x_m + 0.1, "{} {} {}", slid.cargo_x_m, held.cargo_x_m, bay.cargo_x_m);
+        // The slide is not planned: the feed-forward does not see it coming and the margin dips for it.
+        assert!(slid.margin < held.margin, "{} vs {}", slid.margin, held.margin);
+        assert!((slid.ff_predicted_m - held.ff_predicted_m).abs() < 1e-6);
+        // The same moment in the joint statics: the ZMP goes forward by the log's share of the slide, onto the toes.
+        let loads = |shift: [f32; 2]| KinLoads::carrying(2.4, 2, [-in_hands, 0.0, 0.0], shift);
+        let at = |shift: [f32; 2]| kin::solve(&b, &kin::KinPose { cargo_kg: 0.0, ..pose }, &loads(shift));
+        let (still, moved) = (at([0.0, 0.0]), at([0.04, 0.0]));
+        let m = b.mass_kg() + 2.4;
+        let want = 2.4 / m * 0.04;
+        assert!((moved.zmp[0] - still.zmp[0] - want).abs() < 0.3 * want, "ZMP +{:.4} m vs {want:.4}", moved.zmp[0] - still.zmp[0]);
+        let toe = |r: &kin::KinReport| r.contact("foot_r").and_then(|c| c.sole).map_or(0.0, |s| s.patches[3].normal_n);
+        assert!(toe(&moved) > toe(&still), "toe patch {} vs {}", toe(&moved), toe(&still));
+        let sh = |r: &kin::KinReport| r.joint("shoulder_r").map_or(0.0, |j| j.ratio);
+        assert!(sh(&moved) > sh(&still), "{} vs {}", sh(&moved), sh(&still));
+        // Sideways it hangs more on the nearer hand.
+        let left = kin::solve(&b, &kin::KinPose { cargo_kg: 0.0, ..pose }, &KinLoads::carrying(2.4, 2, [0.0; 3], [0.0, 0.05]));
+        assert!(left.joint("shoulder_l").unwrap().ratio > left.joint("shoulder_r").unwrap().ratio);
+        let side = b.solve(&Posture::quiet(2.4).held_in_hands(arms, [0.0, 0.05]), &ff, 1e3);
+        assert!(shoulder_l(&side) > shoulder(&side) && side.com[1] > held.com[1]);
+        fn shoulder_l(r: &crate::balance::BalanceReport) -> f32 {
+            r.joint("shoulder_l").map_or(0.0, |j| j.peak_ratio)
+        }
+    }
 }

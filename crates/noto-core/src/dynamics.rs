@@ -162,7 +162,7 @@ impl Robot {
                 pm += body.chest.battery_kg as f64;
                 pc = add(pc, scale([0.0, 0.0, -(body.belly.com_down_m as f64)], body.chest.battery_kg as f64));
             }
-            if post.cargo_kg > 0.0 && body.cargo_point().1 {
+            if post.cargo_kg > 0.0 && body.cargo_point().1 && !body.holds_cargo(post) {
                 pm += post.cargo_kg as f64;
                 pc = add(pc, scale([body.dims.cargo_x_m as f64, 0.0, (body.dims.cargo_z_m() - body.dims.waist_m) as f64], post.cargo_kg as f64));
             }
@@ -216,7 +216,9 @@ impl Robot {
             joints.push(sim(&format!("elbow_{tag}"), Segment::Arm, &body.arm.elbow, 0.0, 150.0));
             let fh = [0.03, 0.03, fo_l / 2.0];
             links.push(Link { name: if side == 0 { "forearm_r" } else { "forearm_l" }, segment: Segment::Arm, parent: Some(sh), origin: [0.0, 0.0, -up_l], axis: ARM_AXIS, dof: Some(dof_joints.len() - 1), locked: None, mass: m_fore, com: [0.0, 0.0, -0.45 * fo_l], inertia: box_inertia(m_fore, fh), shape: ([0.0, 0.0, -fo_l / 2.0], fh) });
-            let hm = body.hand_kg as f64 + post.hand_load_kg[side] as f64;
+            // A load carried in the hands rides at the palms here; its slide is in the statics the motion aims at.
+            let held = body.held_on(post, side, [0.0, 0.0]).map_or(0.0, |h| h.0);
+            let hm = body.hand_kg as f64 + post.hand_load_kg[side] as f64 + held as f64;
             let hh = [0.04, 0.05, 0.04];
             links.push(Link { name: if side == 0 { "hand_r" } else { "hand_l" }, segment: Segment::Hand, parent: Some(el), origin: [0.0, 0.0, -fo_l], axis: ARM_AXIS, dof: None, locked: None, mass: hm, com: [0.0, 0.0, -0.06], inertia: box_inertia(hm, hh), shape: ([0.0, 0.0, -0.05], hh) });
         }
@@ -758,7 +760,7 @@ fn lower_masses(body: &Body, post: &Posture, single: bool, root: &RootState, hea
             v.push((mm.kg as f64, mv(&r, d3(mm.at))));
         }
         let (at, on_pelvis) = body.cargo_point();
-        if post.cargo_kg > 0.0 && !(on_pelvis && body.has_torso()) {
+        if post.cargo_kg > 0.0 && !(on_pelvis && body.has_torso()) && !body.holds_cargo(post) {
             v.push((post.cargo_kg as f64, mv(&r, d3(at))));
         }
     }

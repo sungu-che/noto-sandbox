@@ -548,11 +548,19 @@ impl World {
                 self.fallen_until = Some(self.time_s + GET_UP_S as f64);
                 return Some(label);
             }
-            let label = format!("{side}발 미끄러짐 {:.0} mm → 회복 (마찰 {mu:.2} < 필요 {:.2})", slide * 1000.0, g.rcof);
-            events.push(self.stamp(WorldEvent::Act { act: "walk".into(), kind: "foot_slip".into(), label, ok: true, value: Some(slide), parts: vec!["foot".into(), "foot_joints".into()] }));
-            // The foot going from under it jerks the load about as far as it slid.
+            // The foot going from under it jerks the load about as far as it slid; what that did to the load goes in
+            // the slip's record, and a load it shook loose follows it.
             let worker = self.acting_id();
-            self.jolt_cargo([0.0, slide / REACTION_JOLT_S], REACTION_JOLT_S, worker, events);
+            let mut shaken = Vec::new();
+            self.jolt_cargo([0.0, slide / REACTION_JOLT_S], REACTION_JOLT_S, worker, "foot_slip", &mut shaken);
+            let load = match self.ride.jolt.filter(|j| j.cause == "foot_slip" && j.time_s == self.time_s) {
+                Some(j) if j.lost => " · 손의 짐을 놓침".to_string(),
+                Some(j) => format!(" · 손 짐 충격 {:.1} m/s² (마찰 이용률 {:.0}%, {:.0} mm 밀림)", j.dv_mps[0].hypot(j.dv_mps[1]) / j.dt_s.max(1e-3), j.use_ratio * 100.0, j.moved_m * 1000.0),
+                None => String::new(),
+            };
+            let label = format!("{side}발 미끄러짐 {:.0} mm → 회복 (마찰 {mu:.2} < 필요 {:.2}){load}", slide * 1000.0, g.rcof);
+            events.push(self.stamp(WorldEvent::Act { act: "walk".into(), kind: "foot_slip".into(), label, ok: true, value: Some(slide), parts: vec!["foot".into(), "foot_joints".into()] }));
+            events.extend(shaken);
         }
         None
     }
@@ -575,11 +583,11 @@ impl World {
             if lift > 1.0 {
                 pose.feet[1 - self.walk.stance][1] *= lift;
             }
-            return Some((self.crouched(self.carrying(pose)), loads, Source::FootLift));
+            return Some((self.crouched(self.carrying(pose)), self.carried_loads(loads.accel), Source::FootLift));
         }
         if self.body.legged() && self.carried_kg() > AMOUNT_EPS {
             let held = self.gaze.map_or(KinPose::stand(&self.body, self.carried_kg()), |g| g.pose);
-            return Some((self.crouched(self.carrying(held)), KinLoads::default(), Source::Quiet));
+            return Some((self.crouched(self.carrying(held)), self.carried_loads([0.0; 3]), Source::Quiet));
         }
         self.gaze.map(|g| (g.pose, KinLoads::default(), Source::Quiet))
     }
@@ -594,12 +602,26 @@ impl World {
         pose.shoulder_deg = held.shoulder_deg;
         pose.elbow_deg = held.elbow_deg;
         pose.closure = held.closure;
+        // The load is in the hands (`carried_loads`), not in the bay.
+        if self.body.arm_count() > 0 {
+            pose.cargo_kg = 0.0;
+        }
         if matches!(&self.active, Some((_, Active::Move(_)))) {
             let cam = hkin::head_camera(&self.body, &pose);
             let want = cam.pos[2].atan2(0.5 * (steps::STEP_LOOK_M[0] + steps::STEP_LOOK_M[1])).to_degrees();
             pose.neck_deg = (pose.neck_deg + want - cam.pitch_down_deg).clamp(0.0, 35.0);
         }
         pose
+    }
+
+    /// The loads on a walker carrying in its hands, the body accelerating at `accel` (forward, left, up): the load's
+    /// weight and inertia on the palms, where it has slid in them. Empty hands carry nothing.
+    fn carried_loads(&self, accel: [f32; 3]) -> KinLoads {
+        let kg = self.carried_kg();
+        if kg <= AMOUNT_EPS || self.body.arm_count() == 0 {
+            return KinLoads { accel, ..KinLoads::default() };
+        }
+        KinLoads::carrying(kg, self.body.arm_count(), accel, self.ride.state.shift)
     }
 
     pub(super) fn act_body_pose(&self) -> Option<BodyPose> {

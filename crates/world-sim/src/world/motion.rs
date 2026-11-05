@@ -931,7 +931,7 @@ impl World {
         let worker = self.acting_id();
         let label = format!("{what}에 {speed:.1} m/s로 부딪힘: {peak_n:.0} N · {:.1} g{}", c.a_peak_g, if fell { " → 넘어짐" } else { "" });
         events.push(self.stamp(WorldEvent::Bump { worker, what: what.into(), peak_n, a_g: c.a_peak_g, speed_mps: speed, fell, label: label.clone() }));
-        self.jolt_cargo([-speed, 0.0], contact_s, worker, events);
+        self.jolt_cargo([-speed, 0.0], contact_s, worker, "bump", events);
         if !fell {
             return None;
         }

@@ -11,6 +11,7 @@
 use super::*;
 use noto_core::act::carry::{self, Holder, LoadSpec, LoadState, Lost};
 use noto_core::balance::G;
+use noto_core::kin::{self as hkin, KinLoads};
 
 /// How far the friction of one haul strays from the table's value (coefficient of variation) [추정].
 pub const HAUL_MU_COV: f32 = 0.12;
@@ -20,6 +21,26 @@ const ACCEL_TAU_S: f32 = 0.08;
 const NOTE_SHIFT_M: f32 = 0.03;
 /// What a load keeps of its shift when the piece above it comes off.
 const SHIFT_KEPT: f32 = 0.4;
+/// A slide in the hands this far since the balance was last solved is solved again at once (m).
+pub const RESOLVE_SHIFT_M: f32 = 0.01;
+
+/// What a load that slid in the hands does to the whole body: the ZMP and the shoulders with the load where it went,
+/// against where the hands hold it; and how hard the ride is on it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct SlideRelay {
+    pub shift_m: [f32; 2],
+    /// How far the slide moved the ZMP forward (m).
+    pub zmp_shift_m: f32,
+    pub margin: f32,
+    pub margin_held: f32,
+    /// The more loaded shoulder's share of its peak torque.
+    pub shoulder_ratio: f32,
+    pub shoulder_ratio_held: f32,
+    /// The load's inertia over what friction and grip hold it with (1 is where it slides).
+    pub use_ratio: f32,
+    /// What the stride added to the ride this tick (forward, up; m/s²).
+    pub stride_mps2: [f32; 2],
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CargoRide {
@@ -34,6 +55,28 @@ pub struct CargoRide {
     pub pending_az: f32,
     pub use_ratio: f32,
     noted: bool,
+    /// What the stride added to the load's ride this tick (forward, up; m/s²): `World::stride_accel`.
+    pub stride: [f32; 2],
+    /// Where the load sat in the hands when the whole body's balance was last solved (forward, left; m).
+    pub solved_shift: [f32; 2],
+    /// The last jolt the body passed on to its load: a slipping foot, a bump, a shove.
+    pub jolt: Option<Jolt>,
+}
+
+/// A sudden change of the support's speed that reached the load (`World::jolt_cargo`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct Jolt {
+    pub time_s: f64,
+    /// What did it: "foot_slip", "bump" or "knock".
+    pub cause: &'static str,
+    /// The change of speed (forward, left; m/s) and how long it took (s).
+    pub dv_mps: [f32; 2],
+    pub dt_s: f32,
+    /// The load's inertia over what holds it, at the jolt (1 is where it slides).
+    pub use_ratio: f32,
+    /// How far it moved the load (m), and whether the load came off.
+    pub moved_m: f32,
+    pub lost: bool,
 }
 
 impl CargoRide {
@@ -47,6 +90,66 @@ impl CargoRide {
 }
 
 impl World {
+    /// Whether this robot carries its load in its two hands before it (a walker between acts), not in a bay or on tines.
+    pub fn carries_in_hands(&self) -> bool {
+        self.body.legged() && self.body.arm_count() > 0 && self.carried_kg() > AMOUNT_EPS && (self.crew_turn.is_some() || self.act.is_none())
+    }
+
+    /// The arms' angles (shoulder, elbow; deg) that hold a load before the body the way a walker carries it.
+    pub(crate) fn carry_arms_deg(&self) -> ([f32; 2], [f32; 2]) {
+        let p = noto_core::act::cocarry::carry_pose(&self.body, noto_core::act::cocarry::carry_hand_z(&self.body));
+        (p.shoulder_deg, p.elbow_deg)
+    }
+
+    /// `post` with the load where it is when this robot carries in its hands: there, as far as it has slid in them.
+    pub(crate) fn with_load_held(&self, post: Posture) -> Posture {
+        if self.carries_in_hands() {
+            post.held_in_hands(self.carry_arms_deg(), self.ride.state.shift)
+        } else {
+            post
+        }
+    }
+
+    /// What the load in the hands does to the whole body now (`SlideRelay`); `None` unless it is carried in them. The
+    /// ZMP and the shoulders are the joint statics of this moment, before the waist leans back against the slide; the
+    /// margins are the balance's, which charges the slide the reaction it takes to answer it.
+    pub fn slide_relay(&self) -> Option<SlideRelay> {
+        if !self.carries_in_hands() {
+            return None;
+        }
+        let (post, _) = self.posture_now();
+        let ff = self.ff_for(post.source);
+        let now = self.body.solve(&post, &ff, 1e3);
+        let held = self.body.solve(&Posture { cargo_shift_m: [0.0, 0.0], ..post }, &ff, 1e3);
+        let (pose, loads, _) = self.act_pose()?;
+        let k_now = hkin::solve_fast(&self.body, &pose, &loads);
+        let k_held = hkin::solve_fast(&self.body, &pose, &KinLoads { cargo_shift_m: [0.0; 3], ..loads });
+        let shoulder = |r: &hkin::KinReport| r.joints.iter().filter(|j| j.name.starts_with("shoulder")).map(|j| j.ratio).fold(0.0, f32::max);
+        Some(SlideRelay {
+            shift_m: post.cargo_shift_m,
+            zmp_shift_m: k_now.zmp[0] - k_held.zmp[0],
+            margin: now.margin,
+            margin_held: held.margin,
+            shoulder_ratio: shoulder(&k_now),
+            shoulder_ratio_held: shoulder(&k_held),
+            use_ratio: self.ride.use_ratio,
+            stride_mps2: self.ride.stride,
+        })
+    }
+
+    /// The trunk's own acceleration within the stride of a walker on the move (forward, up; m/s²), which its hands
+    /// share: the centre of mass speeds up and slows down over each foot and bobs up and down between the feet
+    /// (`gait::com_at`). Zero on wheels and standing.
+    pub(crate) fn stride_accel(&self) -> [f32; 2] {
+        if !self.body.legged() || self.agent.speed_mps <= 1e-3 {
+            return [0.0, 0.0];
+        }
+        let Some((g, _, _)) = self.walk.plan.as_ref() else { return [0.0, 0.0] };
+        let u = (self.walk.since_step_m / g.step_m.max(1e-3)).clamp(0.0, 1.0);
+        let c = noto_core::act::gait::com_at(g, u * g.step_s);
+        [c.ax, c.az]
+    }
+
     /// The load on this robot as a load on its support, for this haul.
     pub fn load_spec(&self) -> Option<LoadSpec> {
         let pieces: Vec<(ItemKind, f32)> = self.agent.carried.iter().filter(|(_, n)| *n > AMOUNT_EPS).copied().collect();
@@ -115,9 +218,12 @@ impl World {
         let (s, c) = self.agent.yaw.sin_cos();
         let (ax, az) = (self.ride.accel[0], self.ride.accel[1]);
         let slope = self.posture_now().0.slope_deg.to_radians();
-        let a = [ax * c + az * s + G * slope.sin(), -ax * s + az * c];
-        let a_z = std::mem::take(&mut self.ride.pending_az);
         let Some(spec) = self.load_spec() else { return false };
+        // The path's acceleration is the base's; what the hands hold also rides the stride: the trunk speeds up and
+        // slows down over each foot and bobs between them, a pull either way and a lighter or heavier load in turn.
+        self.ride.stride = if spec.holder == Holder::Hands { self.stride_accel() } else { [0.0, 0.0] };
+        let a = [ax * c + az * s + G * slope.sin() + self.ride.stride[0], -ax * s + az * c];
+        let a_z = std::mem::take(&mut self.ride.pending_az) + self.ride.stride[1];
         let r = carry::ride(&spec, self.ride.state, a, a_z, dt);
         self.ride.state = r.state;
         self.ride.use_ratio = r.use_ratio;
@@ -127,7 +233,9 @@ impl World {
             let item = self.agent.carried.last().map(|c| c.0);
             if let Some(item) = item {
                 let how = if spec.holder == Holder::Tines { "포크 위에서" } else { "손에서" };
-                let label = format!("{} {how} {:.0} cm 밀림 (마찰 이용률 {:.0}%)", item.spec().label_ko, shift * 100.0, r.use_ratio * 100.0);
+                // In the hands the slide reaches the whole body: say what it did to the ZMP and the shoulders.
+                let body = self.slide_relay().map_or(String::new(), |b| format!(" → ZMP {:+.0} mm · 어깨 부하 {:.0} → {:.0}%", b.zmp_shift_m * 1000.0, b.shoulder_ratio_held * 100.0, b.shoulder_ratio * 100.0));
+                let label = format!("{} {how} {:.0} cm 밀림 (마찰 이용률 {:.0}%){body}", item.spec().label_ko, shift * 100.0, r.use_ratio * 100.0);
                 events.push(self.stamp(WorldEvent::CargoSlip { worker, item, shift_m: shift, use_ratio: r.use_ratio, label }));
             }
         }
@@ -141,11 +249,14 @@ impl World {
     }
 
     /// A sudden change of speed the tick cannot see (`dv`, forward and left, over `dt_s`): a bump, a slipping foot.
-    pub(super) fn jolt_cargo(&mut self, dv: [f32; 2], dt_s: f32, worker: u32, events: &mut Vec<TimedEvent>) -> bool {
+    pub(super) fn jolt_cargo(&mut self, dv: [f32; 2], dt_s: f32, worker: u32, cause: &'static str, events: &mut Vec<TimedEvent>) -> bool {
         let Some(spec) = self.load_spec() else { return false };
+        let before = self.ride.state.shift;
         let r = carry::jolt(&spec, self.ride.state, dv, dt_s);
         self.ride.state = r.state;
         self.ride.use_ratio = r.use_ratio;
+        let moved_m = (r.state.shift[0] - before[0]).hypot(r.state.shift[1] - before[1]);
+        self.ride.jolt = Some(Jolt { time_s: self.time_s, cause, dv_mps: dv, dt_s, use_ratio: r.use_ratio, moved_m, lost: r.lost.is_some() });
         match r.lost {
             Some(why) => {
                 self.lose_piece(why, worker, events);
@@ -159,7 +270,7 @@ impl World {
     /// back as events, for whoever watches the world.
     pub fn knock_load(&mut self, dv: [f32; 2], dt_s: f32) -> Vec<TimedEvent> {
         let mut ev = Vec::new();
-        self.jolt_cargo(dv, dt_s, 1, &mut ev);
+        self.jolt_cargo(dv, dt_s, 1, "knock", &mut ev);
         ev
     }
 
@@ -313,13 +424,156 @@ mod tests {
         for i in 0..80 {
             ev.extend(w.tick());
             if i % 6 == 5 {
-                w.jolt_cargo([-3.5, 0.0], 0.03, 1, &mut ev);
+                w.jolt_cargo([-3.5, 0.0], 0.03, 1, "bump", &mut ev);
             }
         }
         assert!(ev.iter().any(|e| matches!(e.event, WorldEvent::CargoLost { .. })), "{:?}", w.ride.state);
         assert_eq!(w.carried_count(ItemKind::Parcel), 0);
         let d = w.drops.iter().find(|d| d.kind == ItemKind::Parcel).expect("it lies on the ground");
         assert!(d.x > x, "it went on the way the truck was going: {} vs {x}", d.x);
+    }
+
+    /// Walks `w` toward `to` for up to `ticks`, the gait planned for `rcof_over` more than the ground's friction (a
+    /// floor slicker than the walker took it for), until `stop` holds of what happened.
+    fn walk_slick(w: &mut World, to: (f32, f32), ticks: usize, rcof_over: f32, stop: impl Fn(&[TimedEvent]) -> bool) -> Vec<TimedEvent> {
+        w.command(Action::MoveTo { x: to.0, z: to.1, reach_m: 0.0 }).unwrap();
+        let mut ev = Vec::new();
+        for _ in 0..ticks {
+            if let Some((g, ground, slope)) = w.walk.plan {
+                let mu = noto_core::surface::available_mu(w.body.base, ground.surface().props());
+                w.walk.plan = Some((noto_core::act::gait::GaitPlan { rcof: mu + rcof_over, ..g }, ground, slope));
+            }
+            ev.extend(w.tick());
+            if stop(&ev) || !w.busy() {
+                break;
+            }
+        }
+        ev
+    }
+
+    fn foot_slip(ev: &[TimedEvent]) -> Option<(String, f32)> {
+        ev.iter().find_map(|e| match &e.event {
+            WorldEvent::Act { kind, label, value, .. } if kind == "foot_slip" => Some((label.clone(), value.unwrap_or(0.0))),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn foot_slip_jolts_hand_cargo() {
+        // A slipping foot the walker catches: the jolt reaches the log in its hands, which a careful grip keeps.
+        let mut w = world(BaseKind::HumanFoot);
+        add_stock(&mut w.agent.carried, ItemKind::Log, 1.0);
+        let (x, z) = (w.agent.x, w.agent.z);
+        let ev = walk_slick(&mut w, (x + 8.0, z), 120, 0.08, |ev| foot_slip(ev).is_some());
+        let (label, slide) = foot_slip(&ev).expect("a foot slipped");
+        let j = w.ride.jolt.expect("the slip reached the load");
+        assert_eq!(j.cause, "foot_slip");
+        assert!((j.dv_mps[1] - slide / 0.1).abs() < 1e-4 && j.use_ratio > 0.0 && !j.lost, "{j:?}");
+        assert!(label.contains("손 짐 충격"), "{label}");
+        assert_eq!(w.carried_count(ItemKind::Log), 1);
+        // A slip it cannot catch: down it goes, and the load with it, on the ground for another trip.
+        let mut w = world(BaseKind::HumanFoot);
+        add_stock(&mut w.agent.carried, ItemKind::Log, 1.0);
+        let ev = walk_slick(&mut w, (x + 8.0, z), 120, 0.6, |ev| ev.iter().any(|e| matches!(e.event, WorldEvent::CargoLost { .. })));
+        assert!(ev.iter().any(|e| matches!(&e.event, WorldEvent::Act { kind, .. } if kind == "fall")), "it fell");
+        assert!(ev.iter().any(|e| matches!(e.event, WorldEvent::CargoLost { .. })) && w.carried_count(ItemKind::Log) == 0);
+    }
+
+    #[test]
+    fn the_stride_rocks_a_load_in_the_hands() {
+        let mut w = world(BaseKind::HumanFoot);
+        add_stock(&mut w.agent.carried, ItemKind::Log, 1.0);
+        let (x, z) = (w.agent.x, w.agent.z);
+        w.command(Action::MoveTo { x: x + 6.0, z, reach_m: 0.0 }).unwrap();
+        let (mut fwd, mut up, mut used) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..80 {
+            w.tick();
+            if w.agent.speed_mps > 0.2 {
+                fwd.push(w.ride.stride[0]);
+                up.push(w.ride.stride[1]);
+                used.push(w.ride.use_ratio);
+            }
+        }
+        // The trunk speeds up and slows down over each foot and bobs between them: the hands feel both ways of each.
+        let spread = |v: &[f32]| v.iter().copied().fold(f32::MIN, f32::max) - v.iter().copied().fold(f32::MAX, f32::min);
+        assert!(fwd.iter().any(|a| *a > 0.05) && fwd.iter().any(|a| *a < -0.05), "{fwd:?}");
+        assert!(up.iter().any(|a| *a > 0.05) && up.iter().any(|a| *a < -0.05), "{up:?}");
+        assert!(spread(&used) > 0.01, "the grip's share moves with the stride: {used:?}");
+        // A careful grip keeps a log through it.
+        assert_eq!(w.carried_count(ItemKind::Log), 1);
+        assert!(w.ride.state.shift[0].abs() < 0.01, "{:?}", w.ride.state);
+        // Wheels have no stride.
+        let mut t = world(BaseKind::Wheel);
+        add_stock(&mut t.agent.carried, ItemKind::Log, 1.0);
+        t.command(Action::MoveTo { x: t.agent.x + 6.0, z: t.agent.z, reach_m: 0.0 }).unwrap();
+        for _ in 0..30 {
+            t.tick();
+            assert_eq!(t.ride.stride, [0.0, 0.0]);
+        }
+    }
+
+    #[test]
+    fn a_slide_in_the_hands_reaches_the_whole_body_at_once() {
+        // Two-finger grippers keep only the least transit grip, so a slide in them runs on past a tick.
+        let mut hand = NotoConfig::preset(FingerCount::Two);
+        hand.base = BaseKind::HumanFoot;
+        let mut w = World::new(WorldConfig { seed: 11, cells: 64, noto: hand, terrain: crate::terrain::TerrainKind::Open, parcels: Some(0), ..WorldConfig::default() }).unwrap();
+        w.nodes.clear();
+        w.drops.clear();
+        w.agent.yaw = 0.0;
+        add_stock(&mut w.agent.carried, ItemKind::Log, 1.0);
+        w.tick();
+        let held = w.balance.clone().unwrap().1;
+        assert!(w.carries_in_hands() && held.cargo_x_m > 0.25, "the log is in the hands before the body: {}", held.cargo_x_m);
+        assert!(held.joint("shoulder_r").unwrap().peak_ratio > 0.05, "the arms hold it");
+        // On the move the log, already sliding forward in the hands, runs on.
+        let (x, z) = (w.agent.x, w.agent.z);
+        w.command(Action::MoveTo { x: x + 6.0, z, reach_m: 0.0 }).unwrap();
+        for _ in 0..12 {
+            w.tick();
+        }
+        w.take_balance_events();
+        let still = w.balance.clone().unwrap().1;
+        // A slide already running gets a few centimetres on before the grip stops it (about 14 m/s² of friction).
+        w.ride.state.vel = [2.2, 0.0];
+        w.tick();
+        let s = w.ride.state.shift;
+        assert!(s[0] >= cargo::RESOLVE_SHIFT_M, "{s:?}");
+        // Solved again in the same tick with the log where it went: no waiting for the next.
+        assert_eq!(w.ride.solved_shift, s);
+        let now = w.balance.clone().unwrap().1;
+        assert!((now.cargo_x_m - still.cargo_x_m - s[0]).abs() < 0.01, "{} vs {} + {:?}", now.cargo_x_m, still.cargo_x_m, s);
+        assert!(w.take_balance_events().iter().any(|e| e.posture.cargo_shift_m == s), "the slide is on the record");
+        // Before the waist answers it the ZMP goes forward by the log's share of the slide; the balance charges the
+        // slide the reaction it takes.
+        let r = w.slide_relay().unwrap();
+        let kg = w.carried_kg();
+        let share = kg / (w.body.mass_kg() + kg) * s[0];
+        assert!((r.zmp_shift_m - share).abs() < 0.3 * share, "{r:?} vs {share}");
+        // The shoulders hold it further out. The margin moves with it, either way: forward of a stance foot whose
+        // ZMP sat behind the middle it can even gain.
+        assert!(r.shoulder_ratio > r.shoulder_ratio_held, "{r:?}");
+        assert!((r.margin - r.margin_held).abs() > 1e-3, "{r:?}");
+    }
+
+    #[test]
+    fn a_walker_carrying_in_its_hands_plans_its_stops_for_the_load_there() {
+        // A mid walker's waist cannot lean back against 6 kg 35 cm before it: the load leaves the feet little room to
+        // stop on, which the load in the bay hid.
+        let mut hand = NotoConfig::preset(FingerCount::Five);
+        hand.base = BaseKind::HumanFoot;
+        let mut w = World::new(WorldConfig { seed: 11, cells: 64, noto: hand, body: noto_core::BodyPlan::uniform(noto_core::parts::Tier::Mid), terrain: crate::terrain::TerrainKind::Open, parcels: Some(0), ..WorldConfig::default() }).unwrap();
+        add_stock(&mut w.agent.carried, ItemKind::IronOre, 1.5);
+        let kg = w.carried_kg();
+        let in_hands = w.planned_accel(0.0, Ground::Dirt, -1.0);
+        let in_bay = w.body.planned_accel_within(&w.limits(), 0.0, kg, Ground::Dirt.surface(), -1.0, ACCEL_TIME_S);
+        assert!(in_hands < 0.8 * in_bay, "{kg} kg: {in_hands} vs {in_bay}");
+        assert!(w.braking_distance_m(0.0, Ground::Dirt) > w.limits().max_speed_mps.powi(2) / (2.0 * in_bay));
+        // A big walker's waist does lean back against it: its stops do not change.
+        let mut big = world(BaseKind::HumanFoot);
+        add_stock(&mut big.agent.carried, ItemKind::Log, 1.0);
+        let kg = big.carried_kg();
+        assert_eq!(big.planned_accel(0.0, Ground::Dirt, -1.0), big.body.planned_accel_within(&big.limits(), 0.0, kg, Ground::Dirt.surface(), -1.0, ACCEL_TIME_S));
     }
 
     #[test]

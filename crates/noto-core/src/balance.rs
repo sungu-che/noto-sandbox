@@ -99,6 +99,14 @@ pub struct Posture {
     pub ground: Surface,
     #[serde(default)]
     pub moving: bool,
+    /// The load (`cargo_kg`) is in the two hands, where the arms (`arm_elev_deg`, `elbow_deg`) hold it before the
+    /// body, not in its bay: a walker carrying in front of it. Its weight then hangs on the shoulders.
+    #[serde(default)]
+    pub cargo_in_hands: bool,
+    /// How far the load has ridden off its seat (forward, left; m): `act::carry::LoadState::shift`. A slide is not
+    /// planned, so the feed-forward does not see it coming.
+    #[serde(default)]
+    pub cargo_shift_m: [f32; 2],
 }
 
 impl Posture {
@@ -115,7 +123,15 @@ impl Posture {
             accel_mps2: 0.0,
             ground: Surface::Firm,
             moving: false,
+            cargo_in_hands: false,
+            cargo_shift_m: [0.0, 0.0],
         }
+    }
+
+    /// This posture with the load held in the hands at the arm angles `(shoulder, elbow)` (deg), ridden `shift_m` off
+    /// the middle of the palms.
+    pub fn held_in_hands(self, arms_deg: ([f32; 2], [f32; 2]), shift_m: [f32; 2]) -> Posture {
+        Posture { arm_elev_deg: arms_deg.0, elbow_deg: arms_deg.1, cargo_in_hands: true, cargo_shift_m: shift_m, ..self }
     }
 
     pub fn propelling(&self) -> bool {
@@ -423,15 +439,13 @@ impl Body {
     }
 
     fn arm_points(&self, side: usize, elev_deg: f32, elbow_deg: f32, load: f32) -> (Vec<Pt>, [f32; 3], [f32; 3]) {
-        let sh = self.shoulder_mount(side);
         let (m_up, r_up, m_fore) = self.arm_split();
         let a = elev_deg.to_radians();
         let b = (elev_deg + elbow_deg).to_radians();
         let du = [a.sin(), 0.0, -a.cos()];
         let df = [b.sin(), 0.0, -b.cos()];
         let at = |o: [f32; 3], d: [f32; 3], r: f32| [o[0] + d[0] * r, o[1] + d[1] * r, o[2] + d[2] * r];
-        let elbow = at(sh, du, self.dims.upper_arm_m);
-        let hand = at(elbow, df, self.dims.forearm_m + 0.06);
+        let (sh, elbow, hand) = self.arm_ends(side, elev_deg, elbow_deg);
         let mut v = vec![
             Pt { seg: Segment::Arm, group: Group::Upper, m: m_up, p: at(sh, du, r_up) },
             Pt { seg: Segment::Arm, group: Group::Upper, m: m_fore, p: at(elbow, df, 0.45 * self.dims.forearm_m) },
@@ -441,6 +455,51 @@ impl Body {
             v.push(Pt { seg: Segment::Hand, group: Group::Upper, m: load, p: hand });
         }
         (v, sh, elbow)
+    }
+
+    /// Whether the load rides in the hands (`Posture::cargo_in_hands`) on a body that has them.
+    pub(crate) fn holds_cargo(&self, post: &Posture) -> bool {
+        post.cargo_in_hands && post.cargo_kg > 0.0 && self.arm_count() > 0
+    }
+
+    /// The share of a load held in the hands that hangs on arm `side` (kg), and where it hangs (body frame). Two hands
+    /// split it by the lever rule about where its centre has slid between them; one hand takes all of it.
+    pub(crate) fn held_on(&self, post: &Posture, side: usize, shift: [f32; 2]) -> Option<(f32, [f32; 3])> {
+        if !self.holds_cargo(post) || side >= self.arm_count() {
+            return None;
+        }
+        let (_, _, hand) = self.arm_ends(side, post.arm_elev_deg[side], post.elbow_deg[side]);
+        let kg = if self.arm_count() >= 2 {
+            let (r, l) = (self.arm_ends(0, post.arm_elev_deg[0], post.elbow_deg[0]).2, self.arm_ends(1, post.arm_elev_deg[1], post.elbow_deg[1]).2);
+            let span = (l[1] - r[1]).max(0.05);
+            let y = 0.5 * (r[1] + l[1]) + shift[1];
+            let share_l = ((y - r[1]) / span).clamp(0.0, 1.0);
+            post.cargo_kg * if side == 0 { 1.0 - share_l } else { share_l }
+        } else {
+            post.cargo_kg
+        };
+        Some((kg, [hand[0] + shift[0], hand[1], hand[2]]))
+    }
+
+    /// Shoulder, elbow and palm of arm `side` at these angles (body frame).
+    fn arm_ends(&self, side: usize, elev_deg: f32, elbow_deg: f32) -> ([f32; 3], [f32; 3], [f32; 3]) {
+        let sh = self.shoulder_mount(side);
+        let a = elev_deg.to_radians();
+        let b = (elev_deg + elbow_deg).to_radians();
+        let at = |o: [f32; 3], d: [f32; 3], r: f32| [o[0] + d[0] * r, o[1] + d[1] * r, o[2] + d[2] * r];
+        let elbow = at(sh, [a.sin(), 0.0, -a.cos()], self.dims.upper_arm_m);
+        (sh, elbow, at(elbow, [b.sin(), 0.0, -b.cos()], self.dims.forearm_m + 0.06))
+    }
+
+    /// How far ahead of the base the carried load's centre is now (m): the palms and its slide when it is held, the
+    /// bay otherwise.
+    pub fn cargo_x_now(&self, post: &Posture) -> f32 {
+        if !self.holds_cargo(post) {
+            return self.dims.cargo_x_m + post.cargo_shift_m[0];
+        }
+        let held: Vec<(f32, [f32; 3])> = (0..self.arm_count()).filter_map(|s| self.held_on(post, s, post.cargo_shift_m)).collect();
+        let kg: f32 = held.iter().map(|h| h.0).sum();
+        held.iter().map(|h| h.0 * h.1[0]).sum::<f32>() / kg.max(1e-6)
     }
 
     fn points(&self, post: &Posture) -> Vec<Pt> {
@@ -461,13 +520,17 @@ impl Body {
             }
             v.push(Pt { seg: Segment::Belly, group: Group::Pelvis, m: self.belly.mass_kg, p: [0.0, 0.0, belly_z] });
         }
-        if post.cargo_kg > 0.0 {
+        if post.cargo_kg > 0.0 && !self.holds_cargo(post) {
             let (p, on_pelvis) = self.cargo_point();
+            let p = [p[0] + post.cargo_shift_m[0], p[1] + post.cargo_shift_m[1], p[2]];
             v.push(Pt { seg: Segment::Belly, group: if on_pelvis { Group::Pelvis } else { Group::Lower }, m: post.cargo_kg, p });
         }
         for side in 0..self.arm_count() {
             let (pts, _, _) = self.arm_points(side, post.arm_elev_deg[side], post.elbow_deg[side], post.hand_load_kg[side]);
             v.extend(pts);
+            if let Some((kg, p)) = self.held_on(post, side, post.cargo_shift_m) {
+                v.push(Pt { seg: Segment::Hand, group: Group::Upper, m: kg, p });
+            }
         }
         for mm in self.mount_masses() {
             v.push(Pt { seg: mm.segment, group: Group::Lower, m: mm.kg, p: mm.at });
@@ -540,9 +603,13 @@ impl Body {
         for i in 0..self.arm_count() {
             let a = post.arm_elev_deg[i].to_radians();
             let reach = arm_len * a.sin();
-            s += 0.05 * m * 0.53 * reach + post.hand_load_kg[i] * reach;
+            // A load held in the hands as planned: where the palms are, not where it may have slid.
+            let held = self.held_on(post, i, [0.0, 0.0]).map_or(0.0, |h| h.0);
+            s += 0.05 * m * 0.53 * reach + (post.hand_load_kg[i] + held) * reach;
         }
-        s += post.cargo_kg * self.cargo_point().0[0];
+        if !self.holds_cargo(post) {
+            s += post.cargo_kg * self.cargo_point().0[0];
+        }
         s / m
     }
 
@@ -552,7 +619,13 @@ impl Body {
 
     pub fn solve(&self, post: &Posture, ff: &FeedForward, grip_capacity_n: f32) -> BalanceReport {
         let (rest_elev, rest_elbow) = self.rest_arms_deg();
-        let base_post = Posture { arm_elev_deg: rest_elev, elbow_deg: rest_elbow, hand_load_kg: [0.0, 0.0], cargo_kg: if post.source == Source::CarryFront { 0.0 } else { post.cargo_kg }, ..*post };
+        // What the body would be without this source's push. Arms holding a load are how a walker carries, unless the
+        // carry is the source; a slide of the load never is.
+        let base_post = if self.holds_cargo(post) && post.source != Source::CarryFront {
+            Posture { hand_load_kg: [0.0, 0.0], cargo_shift_m: [0.0, 0.0], ..*post }
+        } else {
+            Posture { arm_elev_deg: rest_elev, elbow_deg: rest_elbow, hand_load_kg: [0.0, 0.0], cargo_kg: if post.source == Source::CarryFront { 0.0 } else { post.cargo_kg }, cargo_shift_m: [0.0, 0.0], ..*post }
+        };
         let uncomp = self.build(post);
         let reference = self.build(&base_post);
         let home = self.home_x();
@@ -638,7 +711,7 @@ impl Body {
         }
 
         let mut rep = BalanceReport {
-            cargo_x_m: self.dims.cargo_x_m,
+            cargo_x_m: self.cargo_x_now(post),
             source: post.source,
             mass_kg: fin.mass,
             hand_load_kg: post.hand_load_kg.iter().sum(),
@@ -721,7 +794,10 @@ impl Body {
         };
         let mut out = Vec::new();
         for side in 0..self.arm_count() {
-            let (pts, sh, el) = self.arm_points(side, post.arm_elev_deg[side], post.elbow_deg[side], post.hand_load_kg[side]);
+            let (mut pts, sh, el) = self.arm_points(side, post.arm_elev_deg[side], post.elbow_deg[side], post.hand_load_kg[side]);
+            if let Some((kg, p)) = self.held_on(post, side, post.cargo_shift_m) {
+                pts.push(Pt { seg: Segment::Hand, group: Group::Upper, m: kg, p });
+            }
             let pts: Vec<Pt> = pts.into_iter().map(|p| Pt { p: tilt(p.p), ..p }).collect();
             let (sh, el) = (tilt(sh), tilt(el));
             let tag = if side == 0 { "r" } else { "l" };
@@ -774,7 +850,10 @@ impl Body {
             Coupling { source: src, target, axis: axis.into(), value, unit: unit.into(), value_noff, effort: k(eps_ff), effort_noff: k(eps_noff), torque_nm: joint.map(|j| j.torque_nm) }
         };
         let quiet_ankle = {
-            let q = Posture { source: Source::Quiet, ..self.quiet(post.cargo_kg) };
+            let mut q = Posture { source: Source::Quiet, ..self.quiet(post.cargo_kg) };
+            if self.holds_cargo(post) {
+                q = q.held_in_hands((post.arm_elev_deg, post.elbow_deg), [0.0, 0.0]);
+            }
             let e = self.evaluate(&q, 0.0, 0.0);
             self.joint_loads(&q, &e, 0.0, 0.0, 1.0).into_iter().find(|j| j.joint == "ankle" || j.joint == "drive").map(|j| j.torque_nm).unwrap_or(0.0)
         };
@@ -919,8 +998,15 @@ impl Body {
     }
 
     pub fn planned_accel_within(&self, l: &DriveLimits, slope_deg: f32, cargo_kg: f32, ground: Surface, dir: f32, min_ramp_s: f32) -> f32 {
-        let p = Posture { source: if slope_deg.abs() >= 3.0 { Source::Slope } else { Source::Quiet }, slope_deg, ground, ..self.quiet(cargo_kg) };
+        self.planned_accel_from(l, &self.quiet(cargo_kg), slope_deg, ground, dir, min_ramp_s)
+    }
+
+    /// `planned_accel_within` for a body standing as `held` stands (the arms and where the load is: in the bay, or in
+    /// the hands before the body, which leaves the feet less room to brake on).
+    pub fn planned_accel_from(&self, l: &DriveLimits, held: &Posture, slope_deg: f32, ground: Surface, dir: f32, min_ramp_s: f32) -> f32 {
+        let p = Posture { source: if slope_deg.abs() >= 3.0 { Source::Slope } else { Source::Quiet }, slope_deg, ground, cargo_shift_m: [0.0, 0.0], ..*held };
         let r = self.solve(&p, &FeedForward::default(), 1e3);
+        let cargo_kg = held.cargo_kg;
         let s = r.support;
         let keep = MARGIN_KEEP * 0.5 * (s[1] - s[0]);
         let room = if dir > 0.0 { r.zmp[0] - (s[0] + keep) } else { (s[1] - keep) - r.zmp[0] };

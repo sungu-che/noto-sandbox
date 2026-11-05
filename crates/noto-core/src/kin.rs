@@ -152,6 +152,10 @@ pub struct KinLoads {
     pub body_force: [f32; 3],
     #[serde(default, skip_serializing_if = "is_zero3")]
     pub body_point: [f32; 3],
+    /// Where the held load's centre sits off the palms (forward, left, up; m): its weight and inertia (`hand_force`)
+    /// act there, so a load that slid forward in the hands loads the shoulders more and moves the ZMP.
+    #[serde(default, skip_serializing_if = "is_zero3")]
+    pub cargo_shift_m: [f32; 3],
 }
 
 fn is_zero3(v: &[f32; 3]) -> bool {
@@ -166,6 +170,19 @@ impl KinLoads {
         } else {
             KinLoads { hand_force: [[0.0, 0.0, f], [0.0; 3]], ..KinLoads::default() }
         }
+    }
+
+    /// `holding`, ridden `shift_m` off the palms (`cargo_shift_m`).
+    pub fn holding_shifted(kg: f32, two_arms: bool, a_up: f32, shift_m: [f32; 3]) -> KinLoads {
+        KinLoads { cargo_shift_m: shift_m, ..KinLoads::holding(kg, two_arms, a_up) }
+    }
+
+    /// A load of `kg` carried in the hands of a body accelerating at `accel` (forward, left, up; m/s²) — its weight and
+    /// its inertia on the palms, split between `arms` hands — with the body's own `accel`, ridden `shift_m` off the palms.
+    pub fn carrying(kg: f32, arms: usize, accel: [f32; 3], shift_m: [f32; 2]) -> KinLoads {
+        let f = [-kg * accel[0], -kg * accel[1], -kg * (G + accel[2])];
+        let hand_force = if arms >= 2 { [f.map(|x| 0.5 * x); 2] } else { [f, [0.0; 3]] };
+        KinLoads { hand_force, accel, cargo_shift_m: [shift_m[0], shift_m[1], 0.0], ..KinLoads::default() }
     }
 }
 
@@ -707,7 +724,17 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
     for m in &masses {
         com = add(com, scale(m.p, m.m / mass.max(1e-6)));
     }
-    let hand_f = [0, 1].map(|s| if s < n_arms { loads.hand_force[s] } else { [0.0; 3] });
+    let mut hand_f = [0, 1].map(|s| if s < n_arms { loads.hand_force[s] } else { [0.0; 3] });
+    // A held load that slid off the palms: its weight acts where it went (forward, up), and a slide sideways between
+    // two hands hangs more of it on the nearer one (the lever rule between the palms).
+    let shift = tilt(loads.cargo_shift_m);
+    let grips = hands.map(|h| add(h, [shift[0], 0.0, shift[2]]));
+    if shift[1] != 0.0 && n_arms >= 2 {
+        let total = add(hand_f[0], hand_f[1]);
+        let span = (hands[1][1] - hands[0][1]).max(0.05);
+        let left = ((0.5 * (hands[0][1] + hands[1][1]) + shift[1] - hands[0][1]) / span).clamp(0.0, 1.0);
+        hand_f = [scale(total, 1.0 - left), scale(total, left)];
+    }
     let mut s_force = scale(g_eff, mass);
     let mut m_o = [0.0f32; 3];
     for m in &masses {
@@ -715,7 +742,7 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
     }
     for s in 0..2 {
         s_force = add(s_force, hand_f[s]);
-        m_o = add(m_o, cross(hands[s], hand_f[s]));
+        m_o = add(m_o, cross(grips[s], hand_f[s]));
     }
     if let Some(b) = bumper {
         s_force = add(s_force, loads.bumper_force);
@@ -735,7 +762,7 @@ fn solve_with(body: &Body, pose: &KinPose, loads: &KinLoads, draw: bool) -> KinR
             t = add(t, cross(sub(m.p, j), scale(g_eff, m.m)));
         }
         for &s in hand_sides {
-            t = add(t, cross(sub(hands[s], j), hand_f[s]));
+            t = add(t, cross(sub(grips[s], j), hand_f[s]));
         }
         t
     };

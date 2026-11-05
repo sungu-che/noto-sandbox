@@ -952,7 +952,9 @@ impl World {
     }
 
     pub fn planned_accel(&self, slope_deg: f32, ground: Ground, dir: f32) -> f32 {
-        self.body.planned_accel_within(&self.limits(), slope_deg, self.carried_kg(), ground.surface(), dir, ACCEL_TIME_S)
+        // A load in the hands, 35 cm before the body, leaves the feet less room to stop on than one in a bay.
+        let stand = self.with_load_held(self.body.quiet(self.carried_kg()));
+        self.body.planned_accel_from(&self.limits(), &stand, slope_deg, ground.surface(), dir, ACCEL_TIME_S)
     }
 
     pub fn braking_distance_m(&self, slope_deg: f32, ground: Ground) -> f32 {
@@ -1341,6 +1343,12 @@ impl World {
         let driven = matches!(self.active, Some((_, Active::Move(_) | Active::Turn { .. })));
         if self.ride_cargo(dt, driven, 1, &mut events) && driven {
             self.finish(false, Some("cargo_lost".into()), &mut events);
+        }
+        // What the load did in the hands this tick reaches the whole body in it: a slide of a centimetre or more is
+        // solved again with the load where it went, not at the next tick's posture.
+        let s = (self.ride.state.shift, self.ride.solved_shift);
+        if self.carries_in_hands() && (s.0[0] - s.1[0]).hypot(s.0[1] - s.1[1]) >= cargo::RESOLVE_SHIFT_M {
+            self.solve_balance(0.0, true);
         }
         let after = (self.agent.x, self.agent.z, self.agent.yaw);
         self.odom.update(before, after, dt, self.odom_over);
@@ -1812,6 +1820,9 @@ impl World {
 
     pub fn posture_now(&self) -> (Posture, String) {
         let (post, state) = self.posture_action();
+        // Between acts a walker's load is in its hands before it, as far as it has slid there.
+        let between_acts = matches!(&self.active, None | Some((_, Active::Move(_) | Active::Turn { .. })) | Some((_, Active::Work(WorkState { kind: WorkKind::Look { .. }, .. }))));
+        let post = if between_acts { self.with_load_held(post) } else { post };
         (Posture { ground: self.ground_here().surface(), ..post }, state)
     }
 
@@ -1874,7 +1885,14 @@ impl World {
     }
 
     fn update_balance(&mut self, dt: f32) {
+        self.solve_balance(dt, false);
+    }
+
+    /// The balance now, its heat and wear over `dt`, and its motion when the posture changed: `slid` when the load moved
+    /// in the hands since the last solve, which changes the posture without changing its name.
+    fn solve_balance(&mut self, dt: f32, slid: bool) {
         let (post, state) = self.posture_now();
+        self.ride.solved_shift = post.cargo_shift_m;
         let grip = match &self.active {
             Some((_, Active::Work(WorkState { kind: WorkKind::Pick { drop, .. }, .. }))) => self.drop_item(*drop).map(|d| self.grip_capacity_for(d.kind, d.amount)),
             _ => None,
@@ -1888,7 +1906,7 @@ impl World {
             *self.wear.entry(j.joint.clone()).or_insert(0.0) += noto_core::wear::damage(&act, j.torque_nm, dt);
         }
         let key = format!("{}|{state}", post.source.id());
-        let changed = self.balance.as_ref().map_or(true, |(k, _)| *k != key);
+        let changed = slid || self.balance.as_ref().map_or(true, |(k, _)| *k != key);
         let digest = if changed {
             let roll = dynamics::simulate(&self.body, &self.last_posture, &post, &self.ff_for(post.source), grip, &DynCfg::default());
             let d = roll.digest();
